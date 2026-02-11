@@ -15,7 +15,7 @@ from .agents.trading_idea_polisher import TradingIdeaPolisher
 from .agents.quant_developer import QuantDeveloper, AlphaExpression
 from .agents.analyst import Analyst
 from .mining.genetic_programming import AlphaGeneticProgramming
-from .data.krx_loader import KRXDataLoader
+from .data.postgres_loader import PostgresDataLoader
 from .backtest.engine import BacktestEngine, BacktestResult
 
 
@@ -67,8 +67,8 @@ class AlphaGPT:
         self.quant_developer = QuantDeveloper(self.llm_client)
         self.analyst = Analyst(self.llm_client)
         
-        # 데이터 로더
-        self.data_loader = KRXDataLoader(cache_dir=cache_dir)
+        # 데이터 로더 (PostgreSQL)
+        self.data_loader = PostgresDataLoader()
         
         # 상태
         self.current_data = None
@@ -99,27 +99,37 @@ class AlphaGPT:
                   universe: Optional[List[str]] = None,
                   start_date: str = "2020-01-01",
                   end_date: str = "2024-12-31",
-                  fields: List[str] = ['open', 'high', 'low', 'close', 'volume']):
+                  include_technical: bool = False):
         """
-        데이터 로드
+        데이터 로드 (PostgreSQL)
         
         Args:
-            universe: 종목 리스트 (None이면 KOSPI200)
+            universe: 종목 리스트 또는 인덱스명 (None이면 KOSPI200)
             start_date: 시작일
             end_date: 종료일
-            fields: 데이터 필드
+            include_technical: 기술적 지표 포함 여부
         """
         logger.info(f"Loading data: {start_date} ~ {end_date}")
         
+        # universe가 None이거나 문자열(인덱스명)인 경우
         if universe is None:
-            universe = self.data_loader.get_kospi200()
-            logger.info(f"Using KOSPI200 universe: {len(universe)} stocks")
+            universe = "KOSPI200"
+            logger.info(f"Using KOSPI200 universe")
         
-        self.current_universe = universe
+        # 인덱스명인 경우 종목 리스트로 변환
+        if isinstance(universe, str):
+            universe_list = self.data_loader.get_universe_by_index(universe)
+            self.current_universe = universe_list
+        else:
+            self.current_universe = universe
+            universe_list = universe
         
         # 패널 데이터 로드
-        self.current_data = self.data_loader.get_panel_data(
-            universe, start_date, end_date, fields
+        self.current_data = self.data_loader.load_data(
+            start_date=start_date,
+            end_date=end_date,
+            universe=universe_list,
+            include_technical=include_technical
         )
         
         # 수익률 계산
@@ -127,7 +137,8 @@ class AlphaGPT:
             self.current_data['returns'] = self.current_data['close'].pct_change()
         
         logger.info(f"Data loaded: {len(self.current_data)} fields, "
-                   f"{len(self.current_data['close'])} days")
+                   f"{len(self.current_data['close'])} days, "
+                   f"{len(self.current_data['close'].columns)} stocks")
         
         return self.current_data
     

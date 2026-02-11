@@ -17,6 +17,7 @@ sentence-transformers>=2.3.0
 finance-datareader>=0.9.31
 pykrx>=1.0.40
 yfinance>=0.2.35
+psycopg2-binary>=2.9.9  # PostgreSQL 연결
 
 # Financial Analysis
 ta-lib>=0.4.28
