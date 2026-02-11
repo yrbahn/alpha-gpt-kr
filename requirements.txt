@@ -14,7 +14,7 @@ faiss-cpu>=1.7.4
 sentence-transformers>=2.3.0
 
 # Korean Stock Market Data
-FinanceDataReader>=0.9.50
+finance-datareader>=0.9.31
 pykrx>=1.0.40
 yfinance>=0.2.35
 

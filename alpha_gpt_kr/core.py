@@ -12,7 +12,7 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from .agents.trading_idea_polisher import TradingIdeaPolisher
-from .agents.quant_developer import QuantDeveloper
+from .agents.quant_developer import QuantDeveloper, AlphaExpression
 from .agents.analyst import Analyst
 from .mining.genetic_programming import AlphaGeneticProgramming
 from .data.krx_loader import KRXDataLoader
@@ -334,7 +334,7 @@ class AlphaGPT:
         
         return result
     
-    def refine(self, alpha_expr: str, feedback: str) -> AlphaExpression:
+    def refine(self, alpha_expr: str, feedback: str):
         """
         알파 개선 (interactive mode)
         
@@ -345,8 +345,6 @@ class AlphaGPT:
         Returns:
             개선된 AlphaExpression
         """
-        from .agents.quant_developer import AlphaExpression
-        
         current_alpha = AlphaExpression(
             expr=alpha_expr,
             description="",

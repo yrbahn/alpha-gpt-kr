@@ -1,0 +1,105 @@
+# Operators Configuration
+# Based on arXiv 2308.00016 Table 1
+
+time_series:
+  - name: shift
+    description: "시계열 데이터를 지정된 기간만큼 이동"
+    params:
+      periods: 1
+    
+  - name: ts_delta
+    description: "현재값 - N일 전 값"
+    params:
+      periods: 1
+    
+  - name: ts_mean
+    description: "이동 평균"
+    params:
+      window: 10
+    
+  - name: ts_std
+    description: "이동 표준편차"
+    params:
+      window: 10
+    
+  - name: ts_corr
+    description: "두 시계열 간의 이동 상관계수"
+    params:
+      window: 10
+    
+  - name: ts_ema
+    description: "지수 이동 평균"
+    params:
+      window: 10
+      alpha: 0.5
+    
+  - name: ts_rank
+    description: "이동 윈도우 내에서의 순위 (0~1)"
+    params:
+      window: 10
+
+cross_sectional:
+  - name: zscore_scale
+    description: "횡단면 Z-score 정규화"
+    params: {}
+    
+  - name: normed_rank
+    description: "횡단면 정규화 순위 (0~1)"
+    params: {}
+    
+  - name: winsorize_scale
+    description: "횡단면 Winsorization (이상치 제거)"
+    params:
+      lower: 0.05
+      upper: 0.95
+
+group_wise:
+  - name: grouped_demean
+    description: "그룹별 평균 제거 (산업 중립화)"
+    params: {}
+    
+  - name: grouped_zscore_scale
+    description: "그룹별 Z-score 정규화"
+    params: {}
+
+element_wise:
+  - name: abs
+    description: "절대값"
+    params: {}
+    
+  - name: log
+    description: "자연로그"
+    params: {}
+    
+  - name: sign
+    description: "부호 함수 (-1, 0, 1)"
+    params: {}
+    
+  - name: add
+    description: "덧셈"
+    params: {}
+    
+  - name: minus
+    description: "뺄셈"
+    params: {}
+    
+  - name: div
+    description: "나눗셈"
+    params: {}
+
+# Default parameters for GP
+genetic_programming:
+  population_size: 100
+  generations: 20
+  crossover_prob: 0.6
+  mutation_prob: 0.3
+  tournament_size: 3
+  elitism: 5
+
+# Backtest defaults
+backtest:
+  initial_capital: 100000000  # 1억원
+  commission: 0.0015  # 0.15%
+  slippage: 0.001     # 0.1%
+  quantiles: [0.2, 0.8]  # Long top 20%, Short bottom 20%
+  leverage: 1.0
