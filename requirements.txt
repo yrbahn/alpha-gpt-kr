@@ -50,6 +50,7 @@ pyyaml>=6.0
 loguru>=0.7.0
 tqdm>=4.66.0
 joblib>=1.3.0
+requests>=2.31.0  # KIS API 통신
 
 # Testing
 pytest>=7.4.0

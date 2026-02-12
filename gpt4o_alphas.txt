@@ -1,0 +1,8 @@
+🧠 GPT-4o 생성 알파 표현식
+============================================================
+
+1. rank(scale(ts_delta(close, 26) / ts_std(close, 26)) * ts_mean(volume, 5) - scale(ts_delta(close, 10)))
+2. rank(ts_delta(scale(close) * ts_mean(volume, 10), 20) / ts_std(close, 10) + ts_mean(volume, 26))
+3. rank(scale(ts_delta(close, 5)) * ts_std(volume, 20) - ts_mean(close, 26) / ts_std(close, 5))
+4. rank(ts_delta(close, 10) * scale(ts_mean(volume, 20)) / ts_std(close, 5) + ts_delta(volume, 26))
+5. rank(ts_delta(close, 5) * ts_std(volume, 26) / scale(ts_std(close, 10)) + ts_mean(volume, 10))

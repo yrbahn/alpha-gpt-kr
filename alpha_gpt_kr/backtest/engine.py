@@ -167,15 +167,17 @@ class BacktestEngine:
             
             # 롱 포지션: 상위 quantiles[1] 이상
             long_mask = ranks >= quantiles[1]
-            if long_mask.sum() > 0:
-                long_weight = leverage / long_mask.sum()
-                positions.loc[date, long_mask] = long_weight
+            long_tickers = long_mask[long_mask].index.tolist()  # 명시적으로 티커 리스트 추출
+            if len(long_tickers) > 0:
+                long_weight = leverage / len(long_tickers)
+                positions.loc[date, long_tickers] = long_weight
             
             # 숏 포지션: 하위 quantiles[0] 이하
             short_mask = ranks <= quantiles[0]
-            if short_mask.sum() > 0:
-                short_weight = -leverage / short_mask.sum()
-                positions.loc[date, short_mask] = short_weight
+            short_tickers = short_mask[short_mask].index.tolist()  # 명시적으로 티커 리스트 추출
+            if len(short_tickers) > 0:
+                short_weight = -leverage / len(short_tickers)
+                positions.loc[date, short_tickers] = short_weight
         
         return positions
     
