@@ -66,9 +66,12 @@ def load_market_data():
     stock_id_list = ', '.join(map(str, stock_ids))
     
     query_prices = f"""
-        SELECT 
+        SELECT
             s.ticker,
             p.date,
+            p.open,
+            p.high,
+            p.low,
             p.close,
             p.volume
         FROM price_data p
@@ -77,20 +80,155 @@ def load_market_data():
         AND p.date >= CURRENT_DATE - INTERVAL '730 days'
         ORDER BY s.ticker, p.date
     """
-    
+
     price_df = pd.read_sql(query_prices, conn)
-    conn.close()
-    
+
+    open_price = price_df.pivot(index='date', columns='ticker', values='open')
+    high = price_df.pivot(index='date', columns='ticker', values='high')
+    low = price_df.pivot(index='date', columns='ticker', values='low')
     close = price_df.pivot(index='date', columns='ticker', values='close')
     volume = price_df.pivot(index='date', columns='ticker', values='volume')
-    
+    returns = close.pct_change()
+
+    # 파생 변수 (OHLC)
+    vwap = (high + low + close) / 3
+    high_low_range = (high - low) / close
+    body = (close - open_price) / open_price
+    upper_shadow = (high - close.clip(lower=open_price)) / close
+    lower_shadow = (close.clip(upper=open_price) - low) / close
+
+    # ── 재무 4분기 추세 변수 ──
+    print("   재무 추세 데이터 로드 중...")
+    import json as _json
+    id_ticker = dict(zip(stocks_df['id'], stocks_df['ticker']))
+
+    fin_df = pd.read_sql(f"""
+        SELECT stock_id, period_end, revenue, operating_income, net_income,
+               total_equity, total_assets, raw_data
+        FROM financial_statements
+        WHERE stock_id IN ({stock_id_list})
+        ORDER BY stock_id, period_end
+    """, conn)
+    conn.close()
+
+    # raw_data에서 ROE, 영업이익률 추출
+    def _parse_raw(row):
+        rd = row.get('raw_data')
+        if rd is None:
+            return {'quarter_type': None, 'roe': None}
+        if isinstance(rd, str):
+            rd = _json.loads(rd)
+        return {
+            'quarter_type': rd.get('quarter', ''),
+            'roe': rd.get('roe'),
+        }
+
+    raw_parsed = fin_df.apply(_parse_raw, axis=1, result_type='expand')
+    fin_df = pd.concat([fin_df, raw_parsed], axis=1)
+    fin_df['ticker'] = fin_df['stock_id'].map(id_ticker)
+    fin_df = fin_df.dropna(subset=['ticker'])
+
+    # 연간(12-31) 제외 → standalone quarterly만 사용
+    fin_df = fin_df[fin_df['quarter_type'] != '연간'].copy()
+
+    # 영업이익률 계산
+    fin_df['op_margin'] = np.where(
+        (fin_df['revenue'].notna()) & (fin_df['revenue'] != 0),
+        fin_df['operating_income'] / fin_df['revenue'],
+        np.nan
+    )
+
+    # 분기 인덱스 (정렬용)
+    fin_df = fin_df.sort_values(['ticker', 'period_end'])
+
+    # 각 종목별 QoQ/YoY 추세 계산
+    trend_records = []
+    for ticker, grp in fin_df.groupby('ticker'):
+        grp = grp.sort_values('period_end').reset_index(drop=True)
+        for i in range(len(grp)):
+            row = grp.iloc[i]
+            rec = {'ticker': ticker, 'period_end': row['period_end']}
+
+            # QoQ (전분기 대비)
+            if i >= 1:
+                prev = grp.iloc[i - 1]
+                if prev['operating_income'] and prev['operating_income'] != 0:
+                    rec['oi_qoq'] = (row['operating_income'] - prev['operating_income']) / abs(prev['operating_income'])
+                if prev['net_income'] and prev['net_income'] != 0:
+                    rec['ni_qoq'] = (row['net_income'] - prev['net_income']) / abs(prev['net_income'])
+                if row['op_margin'] is not None and prev['op_margin'] is not None:
+                    rec['margin_qoq'] = row['op_margin'] - prev['op_margin']
+                if row['roe'] is not None and prev['roe'] is not None:
+                    rec['roe_qoq'] = row['roe'] - prev['roe']
+
+            # YoY (4분기 전 = 같은 분기 전년) - Q1/Q2/Q3 순서로 3분기씩이므로 3칸 뒤
+            if i >= 3:
+                yoy_prev = grp.iloc[i - 3]
+                # 같은 분기인지 확인 (3/31↔3/31, 6/30↔6/30, 9/30↔9/30)
+                if row['period_end'].month == yoy_prev['period_end'].month:
+                    if yoy_prev['operating_income'] and yoy_prev['operating_income'] != 0:
+                        rec['oi_yoy'] = (row['operating_income'] - yoy_prev['operating_income']) / abs(yoy_prev['operating_income'])
+                    if yoy_prev['net_income'] and yoy_prev['net_income'] != 0:
+                        rec['ni_yoy'] = (row['net_income'] - yoy_prev['net_income']) / abs(yoy_prev['net_income'])
+                    if row['op_margin'] is not None and yoy_prev['op_margin'] is not None:
+                        rec['margin_yoy'] = row['op_margin'] - yoy_prev['op_margin']
+                    if row['roe'] is not None and yoy_prev['roe'] is not None:
+                        rec['roe_yoy'] = row['roe'] - yoy_prev['roe']
+
+            # 3분기 추세 기울기 (최근 3분기 OI의 선형 추세)
+            if i >= 2:
+                oi_vals = [grp.iloc[j]['operating_income'] for j in range(i - 2, i + 1)
+                           if grp.iloc[j]['operating_income'] is not None and not np.isnan(grp.iloc[j]['operating_income'])]
+                if len(oi_vals) == 3:
+                    # 간단한 선형 기울기: (last - first) / 2
+                    rec['oi_trend'] = (oi_vals[2] - oi_vals[0]) / (abs(oi_vals[0]) + 1e-10)
+
+            trend_records.append(rec)
+
+    trend_df = pd.DataFrame(trend_records)
+
+    # 일별 데이터로 변환: 분기별 → 일별 forward-fill, cross-sectional rank
+    trend_vars = {}
+    trend_fields = ['oi_qoq', 'ni_qoq', 'oi_yoy', 'ni_yoy', 'margin_yoy', 'roe_yoy', 'oi_trend']
+    trend_field_names = []
+
+    for field in trend_fields:
+        if field not in trend_df.columns:
+            continue
+        pivot = trend_df.pivot_table(index='period_end', columns='ticker', values=field, aggfunc='last')
+        if pivot.empty or pivot.notna().sum().sum() < 50:
+            continue
+        # 일별 reindex + forward-fill
+        daily = pivot.reindex(close.index).ffill()
+        daily = daily.reindex(columns=close.columns)
+        # cross-sectional rank [0,1] (매일)
+        ranked = daily.rank(axis=1, pct=True)
+        var_name = f'{field}_rank'
+        trend_vars[var_name] = ranked
+        trend_field_names.append(var_name)
+
     print(f"✅ {len(close.columns)}개 종목, {len(close)}일 데이터")
-    
-    return {
+    print(f"   가격 변수: close, open_price, high, low, volume, returns, vwap, high_low_range, body")
+    if trend_field_names:
+        print(f"   재무 추세 변수 ({len(trend_field_names)}개): {', '.join(trend_field_names)}")
+    else:
+        print(f"   ⚠️  재무 추세 변수 생성 실패")
+
+    result = {
         'close': close,
+        'open_price': open_price,
+        'high': high,
+        'low': low,
         'volume': volume,
-        'returns': close.pct_change()
+        'returns': returns,
+        'vwap': vwap,
+        'high_low_range': high_low_range,
+        'body': body,
+        'upper_shadow': upper_shadow,
+        'lower_shadow': lower_shadow,
     }
+    result.update(trend_vars)
+    return result
 
 def generate_seed_alphas_gpt4o(num_seeds=20):
     """GPT-4o + 개선된 QuantDeveloper 프롬프트로 시드 알파 생성"""
@@ -111,36 +249,60 @@ Generate {num_seeds} diverse, high-performance alpha expressions optimized for *
 모멘텀, 거래량, 변동성, 추세 강도를 조합하여 다양한 팩터를 생성.
 
 ### Available Data Fields
-close, volume, returns
+close, open_price, high, low, volume, returns, vwap, high_low_range, body, upper_shadow, lower_shadow,
+oi_yoy_rank, ni_yoy_rank, oi_qoq_rank, oi_trend_rank, margin_yoy_rank, roe_yoy_rank
+
+**Price variables** (daily time-series):
+- `close`, `open_price`, `high`, `low`: OHLC prices
+- `volume`: trading volume
+- `returns`: daily close-to-close returns
+- `vwap`: (high + low + close) / 3
+- `high_low_range`, `body`, `upper_shadow`, `lower_shadow`: candle pattern ratios
+
+**Fundamental TREND rank variables** (cross-sectional rank [0,1], higher = more improvement):
+- `oi_yoy_rank`: 영업이익 YoY 변화율 순위 (전년 동분기 대비 개선도)
+- `ni_yoy_rank`: 순이익 YoY 변화율 순위
+- `oi_qoq_rank`: 영업이익 QoQ 변화율 순위 (전분기 대비 개선도)
+- `oi_trend_rank`: 영업이익 3분기 추세 기울기 순위
+- `margin_yoy_rank`: 영업이익률 YoY 변화 순위
+- `roe_yoy_rank`: ROE YoY 변화 순위
+
+**IMPORTANT for fundamental trend variables**:
+- These capture IMPROVEMENT (not level) — "ROE가 개선중인 종목" not "ROE가 높은 종목"
+- Already cross-sectionally ranked [0,1], do NOT apply normed_rank() again
+- Use as weights with price signals: `ops.cwise_mul(ops.ts_delta_ratio(close, 15), oi_yoy_rank)` — momentum × earnings improvement
+- DO NOT apply ts_delta/ts_delta_ratio/ts_corr on them (they change quarterly, will create artifacts)
 
 ### Requirements
 
 **Diversity** — Each alpha MUST belong to a DIFFERENT category:
-  1. `momentum_volume` — Momentum confirmed by volume surge
-  2. `volatility_adjusted` — Signal adjusted/filtered by volatility
-  3. `short_term_reversal` — Mean-reversion exploiting KRX reversal effect
-  4. `multi_timeframe` — Combining short + medium + long timeframes
-  5. `price_volume_diverge` — Price-volume divergence / smart money
-  6. `trend_strength` — Trend strength via regression slope or IR
-  7. `tail_risk` — Skewness/kurtosis-based risk signal
-  8. `price_position` — Price position relative to recent high/low
-  9. `volume_anomaly` — Abnormal volume detection
-  10. `composite` — 3+ factor composite signal
-  11. `momentum_volume` — Variation with different timeframes
-  12. `volatility_adjusted` — Variation with different approach
-  13. `short_term_reversal` — Variation with volume filter
-  14. `multi_timeframe` — Variation with volatility
-  15. `price_volume_diverge` — Variation with trend
-  16. `trend_strength` — Variation with volume
-  17. `composite` — Different 3+ factor combination
-  18. `price_position` — Variation with momentum
-  19. `volume_anomaly` — Variation with reversal
-  20. `composite` — Most complex combination
+  1. `ma_golden_cross` — Moving average crossover: `ops.div(ops.ts_mean(close, 5), ops.ts_mean(close, 20))` × fundamental rank (PROVEN: IC 0.039)
+  2. `ma_distance` — Price distance from long-term MA: `ops.div(close, ops.ts_mean(close, 120))` (PROVEN: IC 0.037)
+  3. `ma_slope` — MA slope/trend strength: `ops.ts_delta_ratio(ops.ts_mean(close, 60), 10)` (PROVEN: IC 0.032)
+  4. `ma_multi_volume` — Multiple MA crossover + volume confirmation (PROVEN: IC 0.031)
+  5. `momentum_volume` — Momentum confirmed by volume surge
+  6. `volatility_adjusted` — Signal adjusted/filtered by volatility (use high_low_range)
+  7. `short_term_reversal` — Mean-reversion exploiting KRX reversal effect
+  8. `multi_timeframe` — Combining short + medium + long timeframes (use 5/20/60/120 windows)
+  9. `price_volume_diverge` — Price-volume divergence / smart money
+  10. `trend_strength` — Trend strength via regression slope or IR
+  11. `earnings_momentum` — Price momentum × earnings improvement (oi_yoy_rank, oi_qoq_rank)
+  12. `price_position` — Price position relative to recent high/low
+  13. `volume_anomaly` — Abnormal volume detection
+  14. `earnings_reversal` — Oversold + earnings improving (reversal × oi_yoy_rank)
+  15. `quality_momentum` — Momentum weighted by margin improvement (margin_yoy_rank)
+  16. `roe_improvement` — Price × ROE improvement (roe_yoy_rank)
+  17. `trend_confirmation` — Price trend + earnings trend aligned (oi_trend_rank)
+  18. `candle_pattern` — Candle body/shadow patterns
+  19. `ma_earnings_composite` — MA signal × multiple fundamental ranks (3+ factors)
+  20. `composite_all` — Most complex: MA + price + volume + fundamental trend
 
 **15-Day Holding Optimization**:
-- Prefer medium-term lookback windows: 10, 15, 20, 30 days (not too short like 3d, not too long like 60d)
+- **Moving averages are highly effective** — use `ops.ts_mean(close, N)` for MA(N), `ops.div(close, ops.ts_mean(close, N))` for distance from MA
+- Use diverse lookback windows: 5, 10, 15, 20, 30, 60, 120 days
 - Combine at least 2 timeframes per alpha
 - Volume confirmation is critical for 15-day predictions
+- **Multiplicative combination with fundamental ranks works better than additive**: use `ops.cwise_mul(price_signal, oi_trend_rank)`
 
 **Quality Checklist** — Every alpha must satisfy ALL:
 - [ ] Multi-factor: combines 2+ distinct signal types
@@ -254,22 +416,41 @@ Return a JSON array:
             except Exception:
                 pass
 
-    # 폴백: 개선된 복합 팩터
+    # 폴백: 개선된 복합 팩터 + MA 기반 알파
     if len(alphas) < 10:
         print(f"⚠️  {len(alphas)}개만 파싱됨, 폴백 추가")
         fallback = [
+            # ── MA 기반 알파 (검증 완료, Test IC 0.03~0.04) ──
+            # 골든크로스(5/20) × 영업이익 추세 (Test IC 0.0391)
+            "ops.normed_rank(ops.cwise_mul(ops.div(ops.ts_mean(close, 5), ops.ts_mean(close, 20)), oi_trend_rank))",
+            # 120일 이격도 (Test IC 0.0369)
+            "ops.normed_rank(ops.div(close, ops.ts_mean(close, 120)))",
+            # 60일 MA 기울기 (Test IC 0.0323)
+            "ops.normed_rank(ops.ts_delta_ratio(ops.ts_mean(close, 60), 10))",
+            # 다중 MA 종합: 골든크로스 × 거래량 + MA기울기 (Test IC 0.0311)
+            "ops.normed_rank(ops.add(ops.cwise_mul(ops.div(ops.ts_mean(close, 5), ops.ts_mean(close, 20)), ops.div(ops.ts_mean(volume, 5), ops.ts_mean(volume, 20))), ops.ts_delta_ratio(ops.ts_mean(close, 20), 10)))",
+            # 이격도 × 거래량 (Test IC 0.0288)
+            "ops.normed_rank(ops.cwise_mul(ops.div(close, ops.ts_mean(close, 20)), ops.div(ops.ts_mean(volume, 5), ops.ts_mean(volume, 20))))",
+            # 골든크로스 × 거래량 (Test IC 0.0280)
+            "ops.normed_rank(ops.cwise_mul(ops.div(ops.ts_mean(close, 5), ops.ts_mean(close, 20)), ops.div(ops.ts_mean(volume, 5), ops.ts_mean(volume, 20))))",
+            # MA이격 120d × oi_yoy (Test IC 0.0233)
+            "ops.normed_rank(ops.cwise_mul(ops.div(close, ops.ts_mean(close, 120)), oi_yoy_rank))",
+            # MA기울기 60d × oi_yoy (Test IC 0.0237)
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(ops.ts_mean(close, 60), 10), oi_yoy_rank))",
+            # ── 기존 검증된 팩터 ──
+            "ops.normed_rank(ops.cwise_mul(ops.cwise_mul(ops.ts_delta_ratio(close, 25), ops.div(ops.ts_median(volume, 10), ops.ts_std(volume, 15))), ops.ts_maxmin_scale(close, 28)))",
             "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 15), ops.div(ops.ts_mean(volume, 5), ops.ts_mean(volume, 20))))",
-            "ops.normed_rank(ops.div(ops.neg(ops.ts_zscore_scale(close, 10)), ops.ts_std(returns, 20)))",
             "ops.normed_rank(ops.neg(ops.ts_corr(ops.ts_delta(close, 5), ops.ts_delta(volume, 5), 20)))",
+            # ── 가격 × 재무 추세 복합 팩터 ──
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 15), oi_yoy_rank))",
+            "ops.normed_rank(ops.cwise_mul(ops.neg(ops.ts_zscore_scale(close, 15)), oi_qoq_rank))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_maxmin_scale(close, 20), oi_trend_rank))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 20), margin_yoy_rank))",
+            "ops.normed_rank(ops.cwise_mul(ops.cwise_mul(ops.ts_delta_ratio(close, 15), oi_yoy_rank), ops.div(ops.ts_mean(volume, 5), ops.ts_mean(volume, 20))))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_linear_reg(close, 20), roe_yoy_rank))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 20), ops.neg(ops.ts_mean(high_low_range, 15))))",
+            "ops.normed_rank(ops.div(ops.neg(ops.ts_zscore_scale(close, 10)), ops.ts_std(returns, 20)))",
             "ops.normed_rank(ops.minus(ops.ts_ir(returns, 5), ops.ts_ir(returns, 20)))",
-            "ops.normed_rank(ops.cwise_mul(ops.ts_maxmin_scale(close, 20), ops.normed_rank(ops.ts_mean(volume, 5))))",
-            "ops.normed_rank(ops.cwise_mul(ops.relu(ops.ts_linear_reg(close, 20)), ops.relu(ops.ts_skew(returns, 20))))",
-            "ops.normed_rank(ops.cwise_mul(ops.cwise_mul(ops.greater(ops.ts_delta_ratio(volume, 5), 0.5), ops.less(ops.ts_delta_ratio(close, 5), 0)), ops.neg(ops.normed_rank(ops.ts_std(returns, 20)))))",
-            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 10), ops.div(ops.ts_mean(volume, 10), ops.ts_mean(volume, 30))))",
-            "ops.normed_rank(ops.minus(ops.ts_linear_reg(close, 10), ops.ts_linear_reg(close, 30)))",
-            "ops.normed_rank(ops.div(ops.ts_max_diff(close, 20), ops.ts_std(close, 20)))",
-            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 20), ops.neg(ops.ts_skew(returns, 15))))",
-            "ops.normed_rank(ops.div(ops.ts_min_diff(close, 15), ops.ts_std(returns, 15)))",
         ]
         alphas = alphas + [f for f in fallback if f not in alphas]
 
@@ -289,8 +470,25 @@ def set_global_data(data):
 def _compute_raw_ic(alpha_expr, data):
     """알파의 raw IC 계산 (train 또는 test 데이터)"""
     close = data['close']
+    open_price = data['open_price']
+    high = data['high']
+    low = data['low']
     volume = data['volume']
     returns = data['returns']
+    vwap = data['vwap']
+    high_low_range = data['high_low_range']
+    body = data['body']
+    upper_shadow = data.get('upper_shadow', (high - close.clip(lower=open_price)) / close)
+    lower_shadow = data.get('lower_shadow', (close.clip(upper=open_price) - low) / close)
+    # 재무 추세 rank 변수 (0~1, cross-sectional rank, 높을수록 개선 중)
+    _empty = pd.DataFrame(np.nan, index=close.index, columns=close.columns)
+    oi_yoy_rank = data.get('oi_yoy_rank', _empty)
+    ni_yoy_rank = data.get('ni_yoy_rank', _empty)
+    oi_qoq_rank = data.get('oi_qoq_rank', _empty)
+    ni_qoq_rank = data.get('ni_qoq_rank', _empty)
+    oi_trend_rank = data.get('oi_trend_rank', _empty)
+    margin_yoy_rank = data.get('margin_yoy_rank', _empty)
+    roe_yoy_rank = data.get('roe_yoy_rank', _empty)
 
     forward_return_15d = close.shift(-15) / close - 1
     alpha_values = eval(alpha_expr)
@@ -317,19 +515,42 @@ def _compute_raw_ic(alpha_expr, data):
 def _multi_factor_bonus(alpha_expr):
     """다중 팩터 구조 보너스"""
     bonus = 0.0
+    trend_vars = ['oi_yoy_rank', 'ni_yoy_rank', 'oi_qoq_rank', 'ni_qoq_rank', 'oi_trend_rank', 'margin_yoy_rank', 'roe_yoy_rank']
+
+    # rank 변수에 ts_delta/ts_corr → 강한 페널티 (분기 경계 artifacts)
+    for rv in trend_vars:
+        if rv in alpha_expr:
+            if re.search(rf'ts_(delta|delta_ratio|corr|cov)\([^)]*{rv}', alpha_expr):
+                return -0.05
+
     # 거래량 사용 보너스
     if 'volume' in alpha_expr:
+        bonus += 0.002
+    # MA 구조 보너스 (검증된 패턴)
+    has_ma = bool(re.search(r'ts_mean\([^)]*close[^)]*,\s*\d+\)', alpha_expr))
+    if has_ma:
+        bonus += 0.002
+        # MA + 재무추세 곱셈 결합 보너스 (가장 강력한 패턴)
+        has_trend = any(tv in alpha_expr for tv in trend_vars)
+        if has_trend and 'cwise_mul' in alpha_expr:
+            bonus += 0.003
+    # 가격+추세 결합 보너스 (다중팩터 장려)
+    has_price_ts = bool(re.search(r'ts_\w+\([^)]*(?:close|open_price|high|low|volume|returns)', alpha_expr))
+    has_trend = any(tv in alpha_expr for tv in trend_vars)
+    if has_price_ts and has_trend:
         bonus += 0.003
     # 다중 타임프레임 보너스 (윈도우 차이 ≥ 2배)
     windows = [int(w) for w in re.findall(r',\s*(\d+)\)', alpha_expr)]
-    if len(windows) >= 2:
-        if max(windows) >= min(windows) * 2:
-            bonus += 0.002
+    if len(windows) >= 2 and max(windows) >= min(windows) * 2:
+        bonus += 0.002
+    # 장기 윈도우 보너스 (60일+ 사용 시)
+    if windows and max(windows) >= 60:
+        bonus += 0.001
     # 복잡도 페널티
     depth = alpha_expr.count('(')
     if depth < 3:
         bonus -= 0.002
-    if depth > 8:
+    if depth > 10:
         bonus -= 0.003
     return bonus
 
@@ -367,7 +588,8 @@ OPERATOR_SWAP_GROUPS = [
     ['cwise_mul', 'add', 'minus'],
 ]
 
-OPERAND_POOL = ['close', 'volume', 'returns']
+OPERAND_POOL = ['close', 'open_price', 'high', 'low', 'volume', 'returns', 'vwap', 'high_low_range', 'body',
+                'oi_yoy_rank', 'ni_yoy_rank', 'oi_qoq_rank', 'oi_trend_rank', 'margin_yoy_rank', 'roe_yoy_rank']
 
 def mutate_alpha(alpha_expr):
     """알파 변이 — 3가지 타입: 윈도우(50%), 연산자(30%), 피연산자(20%)"""
@@ -387,15 +609,22 @@ def mutate_alpha(alpha_expr):
         return None
 
 def _mutate_window(alpha_expr):
-    """윈도우 파라미터 변경 (범위 5~50)"""
+    """윈도우 파라미터 변경 (범위 5~120, MA 장기 시그널 지원)"""
     matches = list(re.finditer(r'(ts_\w+|shift)\([^,]+,\s*(\d+)\)', alpha_expr))
     if not matches:
         return None
     match = random.choice(matches)
     old_window = int(match.group(2))
-    new_window = max(5, min(50, old_window + random.choice([-7, -5, -3, -2, 2, 3, 5, 7, 10])))
+    # 현재 윈도우 크기에 따라 변이 폭 조절 (비례적 변이)
+    if old_window <= 20:
+        deltas = [-5, -3, -2, 2, 3, 5, 7, 10, 15]
+    elif old_window <= 60:
+        deltas = [-15, -10, -7, -5, 5, 7, 10, 15, 20, 30]
+    else:
+        deltas = [-30, -20, -10, 10, 20, 30]
+    new_window = max(5, min(120, old_window + random.choice(deltas)))
     if new_window == old_window:
-        new_window = max(5, old_window + random.choice([-10, 10]))
+        new_window = max(5, min(120, old_window + random.choice([-20, 20])))
     start, end = match.span(2)
     return alpha_expr[:start] + str(new_window) + alpha_expr[end:]
 
@@ -441,9 +670,58 @@ def _mutate_operand(alpha_expr):
     return alpha_expr.replace(old_operand, new_operand, 1)
 
 
-def crossover_alphas(alpha1, alpha2):
-    """알파 교차 — 두 알파의 윈도우 파라미터를 교환"""
+def _subtree_crossover(alpha1, alpha2):
+    """서브트리 교차 — 한 알파의 서브트리를 다른 알파의 서브트리로 교체"""
     try:
+        # ops.xxx(...) 패턴의 서브트리 추출
+        def find_subtrees(expr):
+            """괄호 매칭으로 ops.xxx(...) 서브트리 위치 찾기"""
+            subtrees = []
+            for m in re.finditer(r'ops\.\w+\(', expr):
+                start = m.start()
+                depth = 0
+                for i in range(m.end() - 1, len(expr)):
+                    if expr[i] == '(':
+                        depth += 1
+                    elif expr[i] == ')':
+                        depth -= 1
+                    if depth == 0:
+                        subtrees.append((start, i + 1, expr[start:i+1]))
+                        break
+            return subtrees
+
+        trees1 = find_subtrees(alpha1)
+        trees2 = find_subtrees(alpha2)
+
+        if len(trees1) < 2 or not trees2:
+            return None
+
+        # alpha1에서 교체할 서브트리 선택 (최상위 제외)
+        replaceable = [t for t in trees1 if t[2] != alpha1]
+        if not replaceable:
+            return None
+
+        target = random.choice(replaceable)
+        donor = random.choice(trees2)
+
+        result = alpha1[:target[0]] + donor[2] + alpha1[target[1]:]
+        # 유효성 검사: ops.가 있고 괄호가 맞는지
+        if result.count('(') != result.count(')') or 'ops.' not in result:
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def crossover_alphas(alpha1, alpha2):
+    """알파 교차 — 윈도우 교환(60%) + 서브트리 교차(40%)"""
+    try:
+        # 40% 확률로 서브트리 교차 시도
+        if random.random() < 0.4:
+            result = _subtree_crossover(alpha1, alpha2)
+            if result:
+                return result
+
         matches1 = list(re.finditer(r'(ts_\w+|shift)\(([^,]+),\s*(\d+)\)', alpha1))
         matches2 = list(re.finditer(r'(ts_\w+|shift)\(([^,]+),\s*(\d+)\)', alpha2))
 
@@ -491,10 +769,36 @@ def _select_diverse_top_n(results, n=5):
 
     return selected
 
-def genetic_programming(seed_alphas, data, generations=40, population_size=150):
-    """개선된 병렬 GP — 구조적 변이 + 다양성 보존 + 조기종료"""
+def _tournament_select(fitness_scores, tournament_size=5):
+    """토너먼트 선택 — 다양성 유지하면서 우수 개체 선호"""
+    candidates = random.sample(fitness_scores, min(tournament_size, len(fitness_scores)))
+    return max(candidates, key=lambda x: x[1])[0]
 
-    print(f"\n🧬 병렬 GP 시작 (개선됨)")
+
+def _fitness_sharing(fitness_scores, sharing_radius=0.8):
+    """적합도 공유 — 같은 구조의 알파끼리 fitness를 나눠 다양성 보존"""
+    structures = {}
+    for alpha, ic in fitness_scores:
+        struct = _get_alpha_structure(alpha)
+        if struct not in structures:
+            structures[struct] = []
+        structures[struct].append((alpha, ic))
+
+    shared = []
+    for struct, members in structures.items():
+        niche_size = len(members)
+        for alpha, ic in members:
+            # 같은 구조가 많을수록 fitness 감소 (niche pressure)
+            shared_ic = ic / (1.0 + sharing_radius * (niche_size - 1))
+            shared.append((alpha, shared_ic))
+
+    return sorted(shared, key=lambda x: x[1], reverse=True)
+
+
+def genetic_programming(seed_alphas, data, generations=50, population_size=200):
+    """최적화된 병렬 GP — 이민 + 토너먼트 선택 + 적합도 공유 + 적응적 변이"""
+
+    print(f"\n🧬 병렬 GP 시작 (v2 최적화)")
     print(f"   Seed: {len(seed_alphas)}개, 세대: {generations}, 개체수: {population_size}, 워커: 4")
 
     population = seed_alphas[:population_size]
@@ -507,58 +811,85 @@ def genetic_programming(seed_alphas, data, generations=40, population_size=150):
     set_global_data(data)
     best_ever = (None, -999.0)
     stagnation_count = 0
-    all_results_history = []  # 모든 세대의 결과 보관
+    immigration_count = 0
+    all_results_history = []
 
-    elite_count = max(5, population_size // 10)  # 10% 엘리트
-    parent_pool_size = 30
+    elite_count = max(5, population_size // 14)  # 7% 엘리트 (수렴 지연)
+    base_mutation_rate = 0.45  # 기본 변이율
 
     for gen in range(1, generations + 1):
-        print(f"\n  세대 {gen}/{generations}")
+        # 적응적 변이율: 정체 시 변이 비중 증가
+        mutation_rate = min(0.7, base_mutation_rate + stagnation_count * 0.05)
+        crossover_rate = 1.0 - mutation_rate
+
+        print(f"\n  세대 {gen}/{generations} (변이율: {mutation_rate:.0%}, 정체: {stagnation_count})")
 
         with Pool(4, initializer=set_global_data, initargs=(data,)) as pool:
             results = pool.map(evaluate_alpha_worker, population)
 
-        fitness_scores = sorted(results, key=lambda x: x[1], reverse=True)
-        all_results_history.extend([(a, ic) for a, ic in fitness_scores if ic > -999.0])
+        # 적합도 공유 적용 (같은 구조끼리 fitness 분산)
+        raw_scores = sorted(results, key=lambda x: x[1], reverse=True)
+        fitness_scores = _fitness_sharing(raw_scores)
+        all_results_history.extend([(a, ic) for a, ic in raw_scores if ic > -999.0])
 
-        best_ic = fitness_scores[0][1]
-        print(f"    최고 IC: {best_ic:.4f}")
+        best_ic = raw_scores[0][1]  # 공유 전 실제 IC
+        median_ic = raw_scores[len(raw_scores)//2][1] if raw_scores else -999.0
+        unique_structures = len(set(_get_alpha_structure(a) for a, _ in raw_scores if _ > -999.0))
+        print(f"    최고 IC: {best_ic:.4f}  중앙값: {median_ic:.4f}  고유구조: {unique_structures}개")
 
         if best_ic > best_ever[1]:
-            best_ever = fitness_scores[0]
+            best_ever = raw_scores[0]
             stagnation_count = 0
             print(f"    🏆 신기록!")
         else:
             stagnation_count += 1
 
-        # 조기종료: 5세대 연속 무개선
+        # 이민(immigration): 정체 시 새로운 개체 주입 (조기종료 대신)
+        if stagnation_count >= 5 and immigration_count < 3:
+            immigration_count += 1
+            stagnation_count = 0
+            n_immigrants = population_size // 4  # 25% 교체
+            print(f"    🌍 이민 #{immigration_count}: {n_immigrants}개 새 개체 주입")
+            # 시드에서 새 변이 생성
+            immigrants = []
+            for _ in range(n_immigrants):
+                parent = random.choice(seed_alphas)
+                # 2-3회 연속 변이로 다양성 극대화
+                for _ in range(random.randint(2, 3)):
+                    m = mutate_alpha(parent)
+                    if m:
+                        parent = m
+                immigrants.append(parent)
+            # 하위 25% 교체
+            population = [a for a, _ in fitness_scores[:population_size - n_immigrants]] + immigrants
+            continue
+
+        # 최종 종료: 이민 3회 후에도 5세대 무개선
         if stagnation_count >= 5:
-            print(f"    ⏹️  5세대 무개선 → 조기종료")
+            print(f"    ⏹️  이민 {immigration_count}회 후 5세대 무개선 → 종료")
             break
 
         # 다음 세대 구성
         next_population = []
 
-        # 엘리트 보존 (10%)
+        # 엘리트 보존 (7%)
         for alpha, _ in fitness_scores[:elite_count]:
             next_population.append(alpha)
 
-        # 나머지: 교차(60%) + 변이(40%)
-        parent_pool = [a for a, ic in fitness_scores[:parent_pool_size]]
-
+        # 토너먼트 선택 + 교차/변이
         while len(next_population) < population_size:
-            if random.random() < 0.6:
-                # 교차
-                parent1 = random.choice(parent_pool)
-                parent2 = random.choice(parent_pool)
+            if random.random() < crossover_rate:
+                # 토너먼트 선택으로 부모 2개 선택 → 교차
+                parent1 = _tournament_select(fitness_scores, tournament_size=5)
+                parent2 = _tournament_select(fitness_scores, tournament_size=5)
                 child = crossover_alphas(parent1, parent2)
                 if child:
                     next_population.append(child)
                 else:
                     next_population.append(parent1)
             else:
-                # 변이 (구조적 변이 포함)
-                parent = random.choice(parent_pool)
+                # 토너먼트 선택 → 변이
+                parent = _tournament_select(fitness_scores, tournament_size=5)
                 mutated = mutate_alpha(parent)
                 if mutated:
                     next_population.append(mutated)
@@ -567,7 +898,7 @@ def genetic_programming(seed_alphas, data, generations=40, population_size=150):
 
         population = next_population[:population_size]
 
-        del results, fitness_scores, next_population
+        del results, raw_scores, fitness_scores, next_population
         gc.collect()
 
     # Top-5 다양한 알파 선택
@@ -577,7 +908,7 @@ def genetic_programming(seed_alphas, data, generations=40, population_size=150):
 
 def main():
     print("=" * 80)
-    print("Alpha-GPT: 15-day Forward with GPT-4o (v3 — Enhanced GP)")
+    print("Alpha-GPT: 15-day Forward with GPT-4o (v6 — Price + Fundamental Trend)")
     print("=" * 80)
     print()
 
@@ -592,16 +923,8 @@ def main():
     print(f"   Train: ~{close.index[0]} ~ {close.index[split_idx-1]}")
     print(f"   Test:  ~{split_date} ~ {close.index[-1]}")
 
-    train_data = {
-        'close': full_data['close'].iloc[:split_idx],
-        'volume': full_data['volume'].iloc[:split_idx],
-        'returns': full_data['returns'].iloc[:split_idx],
-    }
-    test_data = {
-        'close': full_data['close'].iloc[split_idx:],
-        'volume': full_data['volume'].iloc[split_idx:],
-        'returns': full_data['returns'].iloc[split_idx:],
-    }
+    train_data = {k: v.iloc[:split_idx] for k, v in full_data.items()}
+    test_data = {k: v.iloc[split_idx:] for k, v in full_data.items()}
 
     # 3. GPT-4o 시드 생성
     seed_alphas = generate_seed_alphas_gpt4o()
@@ -610,8 +933,8 @@ def main():
     (best_alpha, best_ic), top_diverse = genetic_programming(
         seed_alphas,
         train_data,
-        generations=40,
-        population_size=150
+        generations=50,
+        population_size=200
     )
 
     # 5. Top-5 OOS 검증
@@ -627,12 +950,16 @@ def main():
         test_ic = evaluate_alpha_oos(alpha, test_data)
         # 팩터 분류
         factors = []
-        if any(kw in alpha for kw in ['close', 'open_price', 'high', 'low']):
+        if any(kw in alpha for kw in ['close', 'open_price', 'high', 'low', 'vwap']):
             factors.append('price')
         if 'volume' in alpha:
             factors.append('volume')
         if 'returns' in alpha:
             factors.append('returns')
+        if any(kw in alpha for kw in ['high_low_range', 'body', 'upper_shadow', 'lower_shadow']):
+            factors.append('candle')
+        if any(kw in alpha for kw in ['oi_yoy_rank', 'ni_yoy_rank', 'oi_qoq_rank', 'ni_qoq_rank', 'oi_trend_rank', 'margin_yoy_rank', 'roe_yoy_rank']):
+            factors.append('fund_trend')
         factor_str = '+'.join(factors) if factors else 'unknown'
 
         status = "✅" if test_ic > 0.015 else "⚠️"
