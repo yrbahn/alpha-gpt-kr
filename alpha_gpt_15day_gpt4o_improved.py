@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Alpha-GPT: 15-day Forward with GPT-4o (Improved Parsing)
-GPT-4o로 Seed 20개 생성 (파싱 개선)
+Alpha-GPT: 15-day Forward with GPT-4o (v2 — Improved Prompt)
+개선된 QuantDeveloper 프롬프트 + ops.xxx() 문법 + 병렬 GP
 """
 
 import sys
 import os
+import re
+import json
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -19,7 +21,8 @@ from multiprocessing import Pool
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from alpha_gpt_kr.mining.operators import AlphaOperators
+from alpha_gpt_kr.mining.operators import AlphaOperators as ops
+from alpha_gpt_kr.agents.quant_developer import QuantDeveloper
 
 load_dotenv()
 
@@ -89,96 +92,192 @@ def load_market_data():
         'returns': close.pct_change()
     }
 
-def generate_seed_alphas_gpt4o():
-    """GPT-4o로 초기 알파 20개 생성 (파싱 개선)"""
-    print("\n🤖 GPT-4o로 초기 알파 20개 생성 중...")
-    
+def generate_seed_alphas_gpt4o(num_seeds=20):
+    """GPT-4o + 개선된 QuantDeveloper 프롬프트로 시드 알파 생성"""
+    print(f"\n🤖 GPT-4o로 초기 알파 {num_seeds}개 생성 중 (개선된 프롬프트)...")
+
     client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    
-    prompt = """Generate EXACTLY 20 diverse alpha factor expressions for predicting 15-day forward stock returns.
 
-Available data:
-- close: stock closing price
-- volume: trading volume  
-- returns: daily returns
+    # QuantDeveloper의 개선된 프롬프트 재사용
+    system_prompt = QuantDeveloper.SYSTEM_PROMPT
 
-Available operators (use EXACTLY):
-- AlphaOperators.ts_delta(x, period)
-- AlphaOperators.ts_mean(x, window)
-- AlphaOperators.ts_std(x, window)
-- AlphaOperators.ts_rank(x, window)
+    # 15일 보유에 특화된 user prompt
+    prompt = f"""### Task
+Generate {num_seeds} diverse, high-performance alpha expressions optimized for **15-day forward returns** in the Korean stock market.
 
-Strategy focus:
-- 15-day holding period
-- Combine momentum, trend, volume
-- Use different windows (5, 10, 15, 20)
+### Trading Idea
+15일 보유 전략에 최적화된 중기 알파 팩터. 단기 노이즈를 필터링하고,
+15일 후 수익률과 높은 상관관계(IC)를 가지는 시그널을 찾아야 함.
+모멘텀, 거래량, 변동성, 추세 강도를 조합하여 다양한 팩터를 생성.
 
-CRITICAL: Output ONLY the 20 Python expressions, one per line. 
-NO explanations, NO numbering, NO markdown, NO extra text.
+### Available Data Fields
+close, volume, returns
 
-Example format (do NOT include these, generate NEW ones):
-AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 15), 10)
-AlphaOperators.ts_rank(volume / AlphaOperators.ts_mean(volume, 20), 10)
-"""
-    
+### Requirements
+
+**Diversity** — Each alpha MUST belong to a DIFFERENT category:
+  1. `momentum_volume` — Momentum confirmed by volume surge
+  2. `volatility_adjusted` — Signal adjusted/filtered by volatility
+  3. `short_term_reversal` — Mean-reversion exploiting KRX reversal effect
+  4. `multi_timeframe` — Combining short + medium + long timeframes
+  5. `price_volume_diverge` — Price-volume divergence / smart money
+  6. `trend_strength` — Trend strength via regression slope or IR
+  7. `tail_risk` — Skewness/kurtosis-based risk signal
+  8. `price_position` — Price position relative to recent high/low
+  9. `volume_anomaly` — Abnormal volume detection
+  10. `composite` — 3+ factor composite signal
+  11. `momentum_volume` — Variation with different timeframes
+  12. `volatility_adjusted` — Variation with different approach
+  13. `short_term_reversal` — Variation with volume filter
+  14. `multi_timeframe` — Variation with volatility
+  15. `price_volume_diverge` — Variation with trend
+  16. `trend_strength` — Variation with volume
+  17. `composite` — Different 3+ factor combination
+  18. `price_position` — Variation with momentum
+  19. `volume_anomaly` — Variation with reversal
+  20. `composite` — Most complex combination
+
+**15-Day Holding Optimization**:
+- Prefer medium-term lookback windows: 10, 15, 20, 30 days (not too short like 3d, not too long like 60d)
+- Combine at least 2 timeframes per alpha
+- Volume confirmation is critical for 15-day predictions
+
+**Quality Checklist** — Every alpha must satisfy ALL:
+- [ ] Multi-factor: combines 2+ distinct signal types
+- [ ] Market-neutral: wrapped with `ops.normed_rank()` or `ops.zscore_scale()`
+- [ ] Multi-timeframe: uses 2+ lookback windows
+- [ ] No look-ahead bias
+- [ ] Complexity 2~4 nesting levels
+- [ ] Safe division: use `ops.div()` instead of raw `/`
+
+### Output Format
+Return a JSON array:
+```json
+[
+  {{
+    "alpha_name": "Alpha_Name",
+    "category": "category_name",
+    "rationale": "Economic logic explanation",
+    "expression": "ops.normed_rank(...)",
+    "complexity": 4,
+    "operators_used": ["op1", "op2"],
+    "timeframes_used": [10, 20]
+  }}
+]
+```
+
+**CRITICAL**:
+- You MUST return a JSON object with key "alphas" containing an array of {num_seeds} alpha objects.
+- Format: {{"alphas": [{{...}}, {{...}}, ...]}}
+- Each object MUST have "expression" field with valid ops.xxx() Python code.
+- Generate ALL {num_seeds} alphas. Do NOT return just 1."""
+
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a quantitative researcher. Output only Python code expressions, nothing else."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.9,
-        max_tokens=2000
+        temperature=0.7,
+        max_tokens=16000,
+        response_format={"type": "json_object"}
     )
-    
+
     content = response.choices[0].message.content
-    
-    # 파싱 개선
+    print(f"   GPT-4o 응답 길이: {len(content)}자")
+    print(f"   응답 미리보기: {content[:200]}...")
+
+    # JSON 파싱
     alphas = []
-    for line in content.split('\n'):
-        line = line.strip()
-        
-        # Skip empty lines, markdown, comments
-        if not line or '```' in line or line.startswith('#'):
-            continue
-            
-        # Remove numbering (1., 1), [1], etc)
-        import re
-        line = re.sub(r'^\d+[\.\)\]:\-\s]+', '', line)
-        
-        # Only lines with AlphaOperators
-        if 'AlphaOperators' in line:
-            # Remove inline comments
-            if '#' in line:
-                line = line.split('#')[0].strip()
-            # Remove trailing quotes
-            line = line.strip('"\'')
-            alphas.append(line)
-    
-    # Fallback if parsing fails
+    try:
+        data = json.loads(content)
+        print(f"   파싱된 타입: {type(data).__name__}")
+
+        # dict → 리스트 추출
+        if isinstance(data, dict):
+            print(f"   키 목록: {list(data.keys())}")
+
+            # 1순위: dict 자체가 단일 알파인 경우 (expression 키 존재)
+            if 'expression' in data or 'expr' in data:
+                data = [data]
+                print(f"   단일 알파 dict → 리스트로 변환")
+
+            else:
+                # 2순위: {"alphas": [{...}, ...]} 형태 — dict 리스트를 가진 키 찾기
+                found_list = False
+                for key in data:
+                    if isinstance(data[key], list) and data[key] and isinstance(data[key][0], dict):
+                        data = data[key]
+                        print(f"   '{key}' 키에서 {len(data)}개 항목 추출")
+                        found_list = True
+                        break
+
+                if not found_list:
+                    # 3순위: 중첩 dict: {"alpha_1": {...}, "alpha_2": {...}}
+                    items = []
+                    for key, val in data.items():
+                        if isinstance(val, dict) and ('expression' in val or 'expr' in val):
+                            items.append(val)
+                    if items:
+                        data = items
+                        print(f"   중첩 dict에서 {len(items)}개 항목 추출")
+                    else:
+                        print(f"   ⚠️  알 수 없는 dict 구조: {list(data.keys())[:5]}")
+                        data = []
+
+        for item in data:
+            if isinstance(item, str):
+                if 'ops.' in item:
+                    alphas.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            expr = item.get('expression', item.get('expr', ''))
+            if expr and 'ops.' in expr:
+                alphas.append(expr)
+            elif expr:
+                print(f"   ⚠️  ops. 없는 표현식 스킵: {expr[:80]}")
+
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"⚠️  JSON 파싱 실패: {e}")
+        # 마크다운 코드블록 안의 JSON 추출 시도
+        json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                for item in data:
+                    if isinstance(item, dict):
+                        expr = item.get('expression', item.get('expr', ''))
+                        if expr and 'ops.' in expr:
+                            alphas.append(expr)
+                print(f"   마크다운 블록에서 {len(alphas)}개 복구")
+            except Exception:
+                pass
+
+    # 폴백: 개선된 복합 팩터
     if len(alphas) < 10:
-        print(f"⚠️  Only {len(alphas)} parsed, adding fallback")
+        print(f"⚠️  {len(alphas)}개만 파싱됨, 폴백 추가")
         fallback = [
-            "AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 15), 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_mean(returns, 15), 10)",
-            "AlphaOperators.ts_rank(close / AlphaOperators.ts_mean(close, 20), 15)",
-            "AlphaOperators.ts_rank(volume / AlphaOperators.ts_mean(volume, 15), 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 15) / AlphaOperators.ts_std(close, 20), 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_delta(volume, 10), 15)",
-            "AlphaOperators.ts_rank(returns / AlphaOperators.ts_std(returns, 20), 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_mean(close, 10) / AlphaOperators.ts_mean(close, 20), 15)",
-            "AlphaOperators.ts_rank(volume * AlphaOperators.ts_delta(close, 5), 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_std(returns, 15), 20)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 10) + AlphaOperators.ts_delta(volume, 10), 15)",
-            "AlphaOperators.ts_rank(close / AlphaOperators.ts_std(close, 20), 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_mean(volume, 5) / AlphaOperators.ts_mean(volume, 20), 15)",
-            "AlphaOperators.ts_rank(returns * volume, 10)",
-            "AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 20) / close, 15)"
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 15), ops.div(ops.ts_mean(volume, 5), ops.ts_mean(volume, 20))))",
+            "ops.normed_rank(ops.div(ops.neg(ops.ts_zscore_scale(close, 10)), ops.ts_std(returns, 20)))",
+            "ops.normed_rank(ops.neg(ops.ts_corr(ops.ts_delta(close, 5), ops.ts_delta(volume, 5), 20)))",
+            "ops.normed_rank(ops.minus(ops.ts_ir(returns, 5), ops.ts_ir(returns, 20)))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_maxmin_scale(close, 20), ops.normed_rank(ops.ts_mean(volume, 5))))",
+            "ops.normed_rank(ops.cwise_mul(ops.relu(ops.ts_linear_reg(close, 20)), ops.relu(ops.ts_skew(returns, 20))))",
+            "ops.normed_rank(ops.cwise_mul(ops.cwise_mul(ops.greater(ops.ts_delta_ratio(volume, 5), 0.5), ops.less(ops.ts_delta_ratio(close, 5), 0)), ops.neg(ops.normed_rank(ops.ts_std(returns, 20)))))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 10), ops.div(ops.ts_mean(volume, 10), ops.ts_mean(volume, 30))))",
+            "ops.normed_rank(ops.minus(ops.ts_linear_reg(close, 10), ops.ts_linear_reg(close, 30)))",
+            "ops.normed_rank(ops.div(ops.ts_max_diff(close, 20), ops.ts_std(close, 20)))",
+            "ops.normed_rank(ops.cwise_mul(ops.ts_delta_ratio(close, 20), ops.neg(ops.ts_skew(returns, 15))))",
+            "ops.normed_rank(ops.div(ops.ts_min_diff(close, 15), ops.ts_std(returns, 15)))",
         ]
         alphas = alphas + [f for f in fallback if f not in alphas]
-    
+
     print(f"✅ {len(alphas)}개 초기 알파 생성")
-    return alphas[:20]
+    for i, a in enumerate(alphas[:5], 1):
+        print(f"   {i}. {a[:80]}...")
+
+    return alphas[:num_seeds]
 
 # 전역 데이터
 _global_data = None
@@ -188,69 +287,91 @@ def set_global_data(data):
     _global_data = data
 
 def evaluate_alpha_worker(alpha_expr):
-    """병렬 처리용 알파 평가"""
+    """병렬 처리용 알파 평가 — ops.xxx() 문법 지원"""
     global _global_data
     data = _global_data
-    
+
     try:
         close = data['close']
         volume = data['volume']
         returns = data['returns']
-        
+
         forward_return_15d = close.shift(-15) / close - 1
-        
+
         alpha_values = eval(alpha_expr)
-        
+
+        # DataFrame이 아닌 경우 스킵
+        if not isinstance(alpha_values, pd.DataFrame):
+            return (alpha_expr, -999.0)
+
         ic_list = []
         for date in alpha_values.index[:-15]:
             alpha_cs = alpha_values.loc[date]
             returns_cs = forward_return_15d.loc[date]
             valid = alpha_cs.notna() & returns_cs.notna()
-            
+
             if valid.sum() > 30:
                 ic = alpha_cs[valid].corr(returns_cs[valid])
                 if not np.isnan(ic):
                     ic_list.append(ic)
-        
+
         if len(ic_list) < 10:
             return (alpha_expr, -999.0)
-        
+
         return (alpha_expr, np.mean(ic_list))
-        
-    except:
+
+    except Exception:
         return (alpha_expr, -999.0)
 
 def mutate_alpha(alpha_expr):
-    """알파 변이"""
+    """알파 변이 — 윈도우 파라미터를 랜덤 변경"""
     try:
-        operators = ['ts_delta', 'ts_mean', 'ts_std', 'ts_rank']
-        for op in operators:
-            if op in alpha_expr:
-                import re
-                match = re.search(rf'{op}\([^,]+,\s*(\d+)\)', alpha_expr)
-                if match:
-                    old_window = int(match.group(1))
-                    new_window = max(5, old_window + random.choice([-5, -2, 2, 5]))
-                    return alpha_expr.replace(f', {old_window})', f', {new_window})')
-        return None
-    except:
+        # ops.xxx() 문법에서 윈도우 파라미터를 가진 모든 연산자
+        matches = list(re.finditer(r'(ts_\w+|shift)\([^,]+,\s*(\d+)\)', alpha_expr))
+        if not matches:
+            return None
+
+        # 랜덤으로 하나 선택
+        match = random.choice(matches)
+        old_window = int(match.group(2))
+        # 15일 보유에 맞는 윈도우 범위 (5~40)
+        new_window = max(5, min(40, old_window + random.choice([-5, -3, -2, 2, 3, 5])))
+        if new_window == old_window:
+            new_window = max(5, old_window + random.choice([-7, 7]))
+
+        # 해당 위치만 교체
+        start, end = match.span(2)
+        return alpha_expr[:start] + str(new_window) + alpha_expr[end:]
+    except Exception:
         return None
 
+
 def crossover_alphas(alpha1, alpha2):
-    """알파 교차"""
+    """알파 교차 — 두 알파의 윈도우 파라미터를 교환"""
     try:
-        operators = ['ts_delta', 'ts_mean', 'ts_std', 'ts_rank']
-        for op in operators:
-            if op in alpha1 and op in alpha2:
-                import re
-                match1 = re.search(rf'{op}\(([^,]+),\s*(\d+)\)', alpha1)
-                match2 = re.search(rf'{op}\(([^,]+),\s*(\d+)\)', alpha2)
-                if match1 and match2:
-                    var1, win1 = match1.groups()
-                    var2, win2 = match2.groups()
-                    return alpha1.replace(f'{op}({var1}, {win1})', f'{op}({var1}, {win2})')
-        return None
-    except:
+        matches1 = list(re.finditer(r'(ts_\w+|shift)\(([^,]+),\s*(\d+)\)', alpha1))
+        matches2 = list(re.finditer(r'(ts_\w+|shift)\(([^,]+),\s*(\d+)\)', alpha2))
+
+        if not matches1 or not matches2:
+            return None
+
+        # 같은 연산자가 있으면 우선 교차
+        ops1 = {m.group(1): m for m in matches1}
+        ops2 = {m.group(1): m for m in matches2}
+        common_ops = set(ops1.keys()) & set(ops2.keys())
+
+        if common_ops:
+            op = random.choice(list(common_ops))
+            m1, m2 = ops1[op], ops2[op]
+        else:
+            m1 = random.choice(matches1)
+            m2 = random.choice(matches2)
+
+        # alpha1의 윈도우를 alpha2의 값으로 교체
+        win2 = m2.group(3)
+        start, end = m1.span(3)
+        return alpha1[:start] + win2 + alpha1[end:]
+    except Exception:
         return None
 
 def genetic_programming(seed_alphas, data, generations=30, population_size=100):
@@ -337,12 +458,12 @@ def main():
     print(f"Expression: {best_alpha}")
     print()
     
-    save = input("\n💾 Save to database? (y/n): ")
-    
-    if save.lower() == 'y':
+    # 자동 저장
+    print("\n💾 데이터베이스에 저장 중...")
+    try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute("""
             INSERT INTO alpha_formulas (formula, ic_score, description, created_at)
             VALUES (%s, %s, %s, NOW())
@@ -353,12 +474,14 @@ def main():
             float(best_ic),
             '15-day forward alpha (500 stocks, market cap top, GPT-4o, gen=20)'
         ))
-        
+
         conn.commit()
         cursor.close()
         conn.close()
-        
+
         print("✅ Saved!")
+    except Exception as e:
+        print(f"⚠️  DB 저장 실패: {e}")
     
     print("\n🎉 완료!")
 
