@@ -286,64 +286,159 @@ def set_global_data(data):
     global _global_data
     _global_data = data
 
+def _compute_raw_ic(alpha_expr, data):
+    """알파의 raw IC 계산 (train 또는 test 데이터)"""
+    close = data['close']
+    volume = data['volume']
+    returns = data['returns']
+
+    forward_return_15d = close.shift(-15) / close - 1
+    alpha_values = eval(alpha_expr)
+
+    if not isinstance(alpha_values, pd.DataFrame):
+        return -999.0
+
+    ic_list = []
+    for date in alpha_values.index[:-15]:
+        alpha_cs = alpha_values.loc[date]
+        returns_cs = forward_return_15d.loc[date]
+        valid = alpha_cs.notna() & returns_cs.notna()
+
+        if valid.sum() > 30:
+            ic = alpha_cs[valid].corr(returns_cs[valid])
+            if not np.isnan(ic):
+                ic_list.append(ic)
+
+    if len(ic_list) < 10:
+        return -999.0
+
+    return float(np.mean(ic_list))
+
+def _multi_factor_bonus(alpha_expr):
+    """다중 팩터 구조 보너스"""
+    bonus = 0.0
+    # 거래량 사용 보너스
+    if 'volume' in alpha_expr:
+        bonus += 0.003
+    # 다중 타임프레임 보너스 (윈도우 차이 ≥ 2배)
+    windows = [int(w) for w in re.findall(r',\s*(\d+)\)', alpha_expr)]
+    if len(windows) >= 2:
+        if max(windows) >= min(windows) * 2:
+            bonus += 0.002
+    # 복잡도 페널티
+    depth = alpha_expr.count('(')
+    if depth < 3:
+        bonus -= 0.002
+    if depth > 8:
+        bonus -= 0.003
+    return bonus
+
 def evaluate_alpha_worker(alpha_expr):
-    """병렬 처리용 알파 평가 — ops.xxx() 문법 지원"""
+    """병렬 처리용 알파 평가 — train IC + 다중팩터 보너스"""
     global _global_data
     data = _global_data
 
     try:
-        close = data['close']
-        volume = data['volume']
-        returns = data['returns']
-
-        forward_return_15d = close.shift(-15) / close - 1
-
-        alpha_values = eval(alpha_expr)
-
-        # DataFrame이 아닌 경우 스킵
-        if not isinstance(alpha_values, pd.DataFrame):
+        raw_ic = _compute_raw_ic(alpha_expr, data)
+        if raw_ic <= -999.0:
             return (alpha_expr, -999.0)
-
-        ic_list = []
-        for date in alpha_values.index[:-15]:
-            alpha_cs = alpha_values.loc[date]
-            returns_cs = forward_return_15d.loc[date]
-            valid = alpha_cs.notna() & returns_cs.notna()
-
-            if valid.sum() > 30:
-                ic = alpha_cs[valid].corr(returns_cs[valid])
-                if not np.isnan(ic):
-                    ic_list.append(ic)
-
-        if len(ic_list) < 10:
-            return (alpha_expr, -999.0)
-
-        return (alpha_expr, np.mean(ic_list))
-
+        bonus = _multi_factor_bonus(alpha_expr)
+        return (alpha_expr, raw_ic + bonus)
     except Exception:
         return (alpha_expr, -999.0)
 
-def mutate_alpha(alpha_expr):
-    """알파 변이 — 윈도우 파라미터를 랜덤 변경"""
+def evaluate_alpha_oos(alpha_expr, test_data):
+    """Out-of-sample IC 계산 (보너스 없이 순수 IC)"""
     try:
-        # ops.xxx() 문법에서 윈도우 파라미터를 가진 모든 연산자
-        matches = list(re.finditer(r'(ts_\w+|shift)\([^,]+,\s*(\d+)\)', alpha_expr))
-        if not matches:
-            return None
+        return _compute_raw_ic(alpha_expr, test_data)
+    except Exception:
+        return -999.0
 
-        # 랜덤으로 하나 선택
-        match = random.choice(matches)
-        old_window = int(match.group(2))
-        # 15일 보유에 맞는 윈도우 범위 (5~40)
-        new_window = max(5, min(40, old_window + random.choice([-5, -3, -2, 2, 3, 5])))
-        if new_window == old_window:
-            new_window = max(5, old_window + random.choice([-7, 7]))
+# 연산자 교환 그룹 (같은 시그니처끼리만 교체)
+OPERATOR_SWAP_GROUPS = [
+    ['ts_mean', 'ts_std', 'ts_median', 'ts_ema', 'ts_linear_reg', 'ts_decayed_linear'],
+    ['ts_zscore_scale', 'ts_maxmin_scale', 'ts_rank'],
+    ['ts_delta', 'ts_delta_ratio'],
+    ['ts_skew', 'ts_kurt', 'ts_ir'],
+    ['ts_min', 'ts_max'],
+    ['ts_argmin', 'ts_argmax'],
+    ['ts_max_diff', 'ts_min_diff'],
+    ['normed_rank', 'zscore_scale'],
+    ['cwise_mul', 'add', 'minus'],
+]
 
-        # 해당 위치만 교체
-        start, end = match.span(2)
-        return alpha_expr[:start] + str(new_window) + alpha_expr[end:]
+OPERAND_POOL = ['close', 'volume', 'returns']
+
+def mutate_alpha(alpha_expr):
+    """알파 변이 — 3가지 타입: 윈도우(50%), 연산자(30%), 피연산자(20%)"""
+    try:
+        mutation_type = random.choices(
+            ['window', 'operator', 'operand'],
+            weights=[0.5, 0.3, 0.2]
+        )[0]
+
+        if mutation_type == 'window':
+            return _mutate_window(alpha_expr)
+        elif mutation_type == 'operator':
+            return _mutate_operator(alpha_expr)
+        else:
+            return _mutate_operand(alpha_expr)
     except Exception:
         return None
+
+def _mutate_window(alpha_expr):
+    """윈도우 파라미터 변경 (범위 5~50)"""
+    matches = list(re.finditer(r'(ts_\w+|shift)\([^,]+,\s*(\d+)\)', alpha_expr))
+    if not matches:
+        return None
+    match = random.choice(matches)
+    old_window = int(match.group(2))
+    new_window = max(5, min(50, old_window + random.choice([-7, -5, -3, -2, 2, 3, 5, 7, 10])))
+    if new_window == old_window:
+        new_window = max(5, old_window + random.choice([-10, 10]))
+    start, end = match.span(2)
+    return alpha_expr[:start] + str(new_window) + alpha_expr[end:]
+
+def _mutate_operator(alpha_expr):
+    """연산자 교체 — 같은 시그니처 그룹 내에서만"""
+    # 현재 표현식에서 연산자 추출
+    op_matches = list(re.finditer(r'ops\.(\w+)\(', alpha_expr))
+    if not op_matches:
+        return None
+
+    # 교환 가능한 연산자만 필터
+    swappable = []
+    for m in op_matches:
+        op_name = m.group(1)
+        for group in OPERATOR_SWAP_GROUPS:
+            if op_name in group:
+                swappable.append((m, op_name, group))
+                break
+
+    if not swappable:
+        return _mutate_window(alpha_expr)  # 교환 불가면 윈도우 변이
+
+    match, old_op, group = random.choice(swappable)
+    candidates = [op for op in group if op != old_op]
+    if not candidates:
+        return _mutate_window(alpha_expr)
+
+    new_op = random.choice(candidates)
+    start, end = match.span(1)
+    return alpha_expr[:start] + new_op + alpha_expr[end:]
+
+def _mutate_operand(alpha_expr):
+    """피연산자 교체 — close/volume/returns 간 교환"""
+    present = [op for op in OPERAND_POOL if op in alpha_expr]
+    if not present:
+        return _mutate_window(alpha_expr)
+
+    old_operand = random.choice(present)
+    candidates = [op for op in OPERAND_POOL if op != old_operand]
+    new_operand = random.choice(candidates)
+
+    # 첫 번째 등장만 교체 (전체 교체 방지)
+    return alpha_expr.replace(old_operand, new_operand, 1)
 
 
 def crossover_alphas(alpha1, alpha2):
@@ -374,115 +469,224 @@ def crossover_alphas(alpha1, alpha2):
     except Exception:
         return None
 
-def genetic_programming(seed_alphas, data, generations=30, population_size=100):
-    """간단한 병렬 GP"""
-    
-    print(f"\n🧬 병렬 GP 시작")
+def _get_alpha_structure(alpha_expr):
+    """알파의 구조 시그니처 (윈도우 제거) — 다양성 비교용"""
+    return re.sub(r',\s*\d+\)', ', N)', alpha_expr)
+
+def _select_diverse_top_n(results, n=5):
+    """IC 상위에서 구조가 다른 Top-N 선택"""
+    sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
+    selected = []
+    seen_structures = set()
+
+    for alpha, ic in sorted_results:
+        if ic <= -999.0:
+            continue
+        structure = _get_alpha_structure(alpha)
+        if structure not in seen_structures:
+            selected.append((alpha, ic))
+            seen_structures.add(structure)
+            if len(selected) >= n:
+                break
+
+    return selected
+
+def genetic_programming(seed_alphas, data, generations=40, population_size=150):
+    """개선된 병렬 GP — 구조적 변이 + 다양성 보존 + 조기종료"""
+
+    print(f"\n🧬 병렬 GP 시작 (개선됨)")
     print(f"   Seed: {len(seed_alphas)}개, 세대: {generations}, 개체수: {population_size}, 워커: 4")
-    
+
     population = seed_alphas[:population_size]
     while len(population) < population_size:
         parent = random.choice(seed_alphas)
         mutated = mutate_alpha(parent)
         if mutated:
             population.append(mutated)
-    
+
     set_global_data(data)
     best_ever = (None, -999.0)
-    
+    stagnation_count = 0
+    all_results_history = []  # 모든 세대의 결과 보관
+
+    elite_count = max(5, population_size // 10)  # 10% 엘리트
+    parent_pool_size = 30
+
     for gen in range(1, generations + 1):
         print(f"\n  세대 {gen}/{generations}")
-        
+
         with Pool(4, initializer=set_global_data, initargs=(data,)) as pool:
             results = pool.map(evaluate_alpha_worker, population)
-        
+
         fitness_scores = sorted(results, key=lambda x: x[1], reverse=True)
-        
+        all_results_history.extend([(a, ic) for a, ic in fitness_scores if ic > -999.0])
+
         best_ic = fitness_scores[0][1]
         print(f"    최고 IC: {best_ic:.4f}")
-        
+
         if best_ic > best_ever[1]:
             best_ever = fitness_scores[0]
+            stagnation_count = 0
             print(f"    🏆 신기록!")
-        
+        else:
+            stagnation_count += 1
+
+        # 조기종료: 5세대 연속 무개선
+        if stagnation_count >= 5:
+            print(f"    ⏹️  5세대 무개선 → 조기종료")
+            break
+
+        # 다음 세대 구성
         next_population = []
-        elite_count = population_size // 5
+
+        # 엘리트 보존 (10%)
         for alpha, _ in fitness_scores[:elite_count]:
             next_population.append(alpha)
-        
+
+        # 나머지: 교차(60%) + 변이(40%)
+        parent_pool = [a for a, ic in fitness_scores[:parent_pool_size]]
+
         while len(next_population) < population_size:
-            if random.random() < 0.7:
-                parent1 = random.choice([a for a, ic in fitness_scores[:20]])
-                parent2 = random.choice([a for a, ic in fitness_scores[:20]])
+            if random.random() < 0.6:
+                # 교차
+                parent1 = random.choice(parent_pool)
+                parent2 = random.choice(parent_pool)
                 child = crossover_alphas(parent1, parent2)
                 if child:
                     next_population.append(child)
                 else:
                     next_population.append(parent1)
             else:
-                parent = random.choice([a for a, ic in fitness_scores[:20]])
+                # 변이 (구조적 변이 포함)
+                parent = random.choice(parent_pool)
                 mutated = mutate_alpha(parent)
                 if mutated:
                     next_population.append(mutated)
                 else:
                     next_population.append(parent)
-        
+
         population = next_population[:population_size]
-        
-        # 메모리 정리
+
         del results, fitness_scores, next_population
         gc.collect()
-    
-    return best_ever
+
+    # Top-5 다양한 알파 선택
+    top_diverse = _select_diverse_top_n(all_results_history, n=5)
+
+    return best_ever, top_diverse
 
 def main():
     print("=" * 80)
-    print("Alpha-GPT: 15-day Forward with GPT-4o (Improved)")
+    print("Alpha-GPT: 15-day Forward with GPT-4o (v3 — Enhanced GP)")
     print("=" * 80)
     print()
-    
-    data = load_market_data()
+
+    # 1. 전체 데이터 로드
+    full_data = load_market_data()
+
+    # 2. Train/Test 분할 (70/30)
+    close = full_data['close']
+    split_idx = int(len(close) * 0.7)
+    split_date = close.index[split_idx]
+    print(f"\n📐 Train/Test 분할: {split_idx}일 train / {len(close) - split_idx}일 test")
+    print(f"   Train: ~{close.index[0]} ~ {close.index[split_idx-1]}")
+    print(f"   Test:  ~{split_date} ~ {close.index[-1]}")
+
+    train_data = {
+        'close': full_data['close'].iloc[:split_idx],
+        'volume': full_data['volume'].iloc[:split_idx],
+        'returns': full_data['returns'].iloc[:split_idx],
+    }
+    test_data = {
+        'close': full_data['close'].iloc[split_idx:],
+        'volume': full_data['volume'].iloc[split_idx:],
+        'returns': full_data['returns'].iloc[split_idx:],
+    }
+
+    # 3. GPT-4o 시드 생성
     seed_alphas = generate_seed_alphas_gpt4o()
-    
-    best_alpha, best_ic = genetic_programming(
-        seed_alphas, 
-        data, 
-        generations=20,  # 20세대 (500종목, 안정성 고려)
-        population_size=100
+
+    # 4. GP 진화 (train 데이터로)
+    (best_alpha, best_ic), top_diverse = genetic_programming(
+        seed_alphas,
+        train_data,
+        generations=40,
+        population_size=150
     )
-    
+
+    # 5. Top-5 OOS 검증
     print("\n" + "=" * 80)
-    print("🏆 BEST ALPHA (15-day forward, GPT-4o)")
+    print("🏆 TOP 5 ALPHAS (Train IC + Test IC)")
     print("=" * 80)
-    print(f"IC: {best_ic:.4f}")
-    print(f"Expression: {best_alpha}")
-    print()
-    
-    # 자동 저장
+
+    validated_alphas = []
+    for i, (alpha, train_ic_with_bonus) in enumerate(top_diverse, 1):
+        # 순수 train IC (보너스 제거)
+        train_ic = _compute_raw_ic(alpha, train_data)
+        # OOS test IC
+        test_ic = evaluate_alpha_oos(alpha, test_data)
+        # 팩터 분류
+        factors = []
+        if any(kw in alpha for kw in ['close', 'open_price', 'high', 'low']):
+            factors.append('price')
+        if 'volume' in alpha:
+            factors.append('volume')
+        if 'returns' in alpha:
+            factors.append('returns')
+        factor_str = '+'.join(factors) if factors else 'unknown'
+
+        status = "✅" if test_ic > 0.015 else "⚠️"
+        print(f"\n  #{i} {status}")
+        print(f"     Train IC: {train_ic:.4f}  |  Test IC: {test_ic:.4f}  [{factor_str}]")
+        print(f"     {alpha[:100]}{'...' if len(alpha) > 100 else ''}")
+
+        validated_alphas.append({
+            'expr': alpha,
+            'train_ic': train_ic,
+            'test_ic': test_ic,
+            'factors': factor_str,
+        })
+
+    # 6. 최종 Best 선정 (test IC가 양수인 것 중 train IC 최고)
+    valid_alphas = [a for a in validated_alphas if a['test_ic'] > 0]
+    if valid_alphas:
+        final_best = max(valid_alphas, key=lambda x: x['train_ic'])
+    else:
+        final_best = validated_alphas[0] if validated_alphas else {'expr': best_alpha, 'train_ic': best_ic, 'test_ic': -999, 'factors': '?'}
+
+    print("\n" + "=" * 80)
+    print("🥇 FINAL BEST (OOS-validated)")
+    print("=" * 80)
+    print(f"Train IC: {final_best['train_ic']:.4f}")
+    print(f"Test IC:  {final_best['test_ic']:.4f}")
+    print(f"Factors:  {final_best['factors']}")
+    print(f"Expression: {final_best['expr']}")
+
+    # 7. DB 저장 (Top-5 전부)
     print("\n💾 데이터베이스에 저장 중...")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO alpha_formulas (formula, ic_score, description, created_at)
-            VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (formula) DO UPDATE
-            SET ic_score = EXCLUDED.ic_score, updated_at = NOW()
-        """, (
-            best_alpha,
-            float(best_ic),
-            '15-day forward alpha (500 stocks, market cap top, GPT-4o, gen=20)'
-        ))
+        for a in validated_alphas:
+            cursor.execute("""
+                INSERT INTO alpha_formulas (formula, ic_score, description, created_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (formula) DO UPDATE
+                SET ic_score = EXCLUDED.ic_score, updated_at = NOW()
+            """, (
+                a['expr'],
+                float(a['train_ic']),
+                f"15d fwd, train IC={a['train_ic']:.4f}, test IC={a['test_ic']:.4f}, factors={a['factors']}, v3-enhanced"
+            ))
 
         conn.commit()
         cursor.close()
         conn.close()
-
-        print("✅ Saved!")
+        print(f"✅ {len(validated_alphas)}개 알파 저장 완료!")
     except Exception as e:
         print(f"⚠️  DB 저장 실패: {e}")
-    
+
     print("\n🎉 완료!")
 
 if __name__ == "__main__":

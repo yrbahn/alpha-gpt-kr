@@ -69,8 +69,8 @@ returns = close.pct_change()
 print(f"✅ {len(close.columns)}개 종목, {len(close)}일 데이터")
 print(f"   최신 날짜: {close.index[-1]}")
 
-# Best Alpha 적용 (IC: 0.0296)
-best_alpha_expr = "ops.normed_rank(ops.cwise_mul(ops.ts_maxmin_scale(close, 24), ops.ts_delta_ratio(close, 25)))"
+# Best Alpha 적용 (v3 Enhanced GP: Train IC 0.0389 / Test IC 0.0385)
+best_alpha_expr = "ops.normed_rank(ops.cwise_mul(ops.cwise_mul(ops.ts_delta_ratio(close, 25), ops.div(ops.ts_median(volume, 10), ops.ts_std(volume, 15))), ops.ts_maxmin_scale(close, 28)))"
 
 print(f"\n🧮 알파 계산 중...")
 print(f"   Expression: {best_alpha_expr}")
@@ -84,7 +84,7 @@ latest_scores = alpha_values.loc[latest_date].dropna().sort_values(ascending=Fal
 print(f"\n{'='*70}")
 print(f"🏆 상위 5종목 (기준일: {latest_date})")
 print(f"   Alpha: {best_alpha_expr}")
-print(f"   IC: 0.0296 (15-day forward)")
+print(f"   Train IC: 0.0389 / Test IC: 0.0385 (15-day forward)")
 print(f"{'='*70}")
 print(f"{'순위':>4} {'종목코드':<10} {'종목명':<16} {'알파점수':>10} {'현재가':>12} {'시총(억)':>12}")
 print(f"{'-'*70}")
@@ -111,7 +111,8 @@ for i, (ticker, score) in enumerate(latest_scores.tail(5).items(), 1):
     print(f"  {i:>2}. {ticker:<10} {name:<16} {score:>10.4f} {price:>12,.0f}원 {mcap_억:>10,.0f}억")
 
 print(f"\n💡 해석:")
-print(f"   - ts_maxmin_scale(close, 24): 24일간 가격 레인지에서의 위치 [0,1]")
-print(f"   - ts_delta_ratio(close, 25): 25일간 수익률")
-print(f"   - 두 신호의 곱: 최근 고점 부근 + 상승 모멘텀 = 매수 신호")
+print(f"   - ts_delta_ratio(close, 25): 25일간 수익률 (모멘텀)")
+print(f"   - ts_median(volume, 10) / ts_std(volume, 15): 거래량 안정성 (중앙값/변동성)")
+print(f"   - ts_maxmin_scale(close, 28): 28일간 가격 레인지에서의 위치 [0,1]")
+print(f"   - 가격 모멘텀 × 거래량 안정성 × 레인지 위치 = 다중 팩터 매수 신호")
 print(f"   - 15영업일(약 3주) 보유 전략에 최적화")
