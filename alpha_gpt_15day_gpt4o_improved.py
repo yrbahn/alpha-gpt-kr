@@ -1616,72 +1616,70 @@ def _make_cv_folds(close_index, n_folds=4, test_days=60, purge_days=20):
 
 def main():
     print("=" * 80)
-    print("Alpha-GPT: 20-day (1-month) Forward with GPT-4o (v10 — CogAlpha: LLM-guided Evolution)")
+    print("Alpha-GPT: 20-day Forward with GPT-4o (v11 — Simple Train/Test Split)")
     print("=" * 80)
     print()
 
     # 1. 전체 데이터 로드
     full_data = load_market_data()
 
-    # 2. Purged Walk-Forward CV 폴드 생성
+    # 2. 단순 Train/Test 분할 (80:20, purge=20일)
     close = full_data['close']
-    cv_folds = _make_cv_folds(close.index, n_folds=4, test_days=60, purge_days=20)
+    n_total = len(close)
+    purge_days = 20
+    test_ratio = 0.20
+    
+    test_days = int(n_total * test_ratio)
+    train_end_idx = n_total - test_days - purge_days - 1
+    test_start_idx = n_total - test_days
+    
+    train_start = close.index[0]
+    train_end = close.index[train_end_idx]
+    test_start = close.index[test_start_idx]
+    test_end = close.index[-1]
+    
+    train_len = len(close.loc[train_start:train_end])
+    test_len = len(close.loc[test_start:test_end])
 
-    print(f"\n📐 Purged Walk-Forward CV ({len(cv_folds)} folds, purge=20d):")
-    for i, (tr_s, tr_e, te_s, te_e) in enumerate(cv_folds, 1):
-        tr_len = len(close.loc[tr_s:tr_e])
-        te_len = len(close.loc[te_s:te_e])
-        print(f"   Fold {i}: Train [{tr_s}~{tr_e}] ({tr_len}d) | Test [{te_s}~{te_e}] ({te_len}d)")
+    print(f"\n📐 Train/Test Split (purge={purge_days}d):")
+    print(f"   Train: [{train_start}] ~ [{train_end}] ({train_len}일, {100-test_ratio*100:.0f}%)")
+    print(f"   Purge: {purge_days}일 (forward return 누출 방지)")
+    print(f"   Test:  [{test_start}] ~ [{test_end}] ({test_len}일, {test_ratio*100:.0f}%)")
 
     # 3. GPT-4o 시드 생성
     seed_alphas = generate_seed_alphas_gpt4o()
 
-    # 4. GP 진화 — 가장 큰 fold의 train 기간으로 1회 실행
-    largest_fold = cv_folds[-1]
-    gp_train_end = largest_fold[1]
-
+    # 4. GP 진화 — Train 기간으로 실행
     (best_alpha, best_ic), top_diverse = genetic_programming(
         seed_alphas,
         full_data,
-        train_start_date=None,
-        train_end_date=gp_train_end,
+        train_start_date=train_start,
+        train_end_date=train_end,
         generations=70,
         population_size=300
     )
 
-    # 5. Top 후보를 모든 CV fold에서 평가
+    # 5. Top 후보를 Test 셋에서 평가
     print("\n" + "=" * 80)
-    print(f"📊 Cross-Validation: Top-{len(top_diverse)} candidates x {len(cv_folds)} folds")
+    print(f"📊 Test Set Evaluation: Top-{len(top_diverse)} candidates")
     print("=" * 80)
 
     all_candidates = []
     for i, (alpha, gp_fitness) in enumerate(top_diverse, 1):
-        fold_train_ics = []
-        fold_test_ics = []
-        fold_test_irs = []
+        # Train IC
+        train_ic = _compute_raw_ic(alpha, full_data, date_start=train_start, date_end=train_end)
+        if train_ic <= -999.0:
+            train_ic = 0.0
 
-        for fi, (tr_s, tr_e, te_s, te_e) in enumerate(cv_folds):
-            train_ic = _compute_raw_ic(alpha, full_data, date_start=tr_s, date_end=tr_e)
-            if train_ic <= -999.0:
-                train_ic = 0.0
-            fold_train_ics.append(train_ic)
-
-            test_ic_list, _ = _compute_ic_series(alpha, full_data, date_start=te_s, date_end=te_e)
-            if len(test_ic_list) >= 5:
-                test_ic = float(np.mean(test_ic_list))
-                test_std = float(np.std(test_ic_list))
-                test_ir = test_ic / max(test_std, 0.001)
-            else:
-                test_ic = -0.05
-                test_ir = -1.0
-            fold_test_ics.append(test_ic)
-            fold_test_irs.append(test_ir)
-
-        # CV 일관성 지표
-        n_positive_folds = sum(1 for ic in fold_test_ics if ic > 0)
-        mean_test_ic = float(np.mean(fold_test_ics))
-        mean_test_ir = float(np.mean(fold_test_irs))
-        mean_train_ic = float(np.mean(fold_train_ics))
+        # Test IC
+        test_ic_list, _ = _compute_ic_series(alpha, full_data, date_start=test_start, date_end=test_end)
+        if len(test_ic_list) >= 5:
+            test_ic = float(np.mean(test_ic_list))
+            test_std = float(np.std(test_ic_list))
+            test_ir = test_ic / max(test_std, 0.001)
+        else:
+            test_ic = -0.05
+            test_ir = -1.0
 
         # 팩터 분류
         factors = []
@@ -1701,37 +1699,23 @@ def main():
 
         all_candidates.append({
             'expr': alpha,
-            'mean_train_ic': mean_train_ic,
-            'mean_test_ic': mean_test_ic,
-            'mean_test_ir': mean_test_ir,
-            'n_positive_folds': n_positive_folds,
-            'fold_test_ics': fold_test_ics,
+            'train_ic': train_ic,
+            'test_ic': test_ic,
+            'test_ir': test_ir,
             'factors': factor_str,
         })
 
         if i <= 10:
-            fold_str = ' '.join([f"F{fi+1}:{ic:+.3f}" for fi, ic in enumerate(fold_test_ics)])
-            print(f"  #{i:2d} [{factor_str:20s}] Train={mean_train_ic:.4f} | Test={mean_test_ic:.4f} | "
-                  f"Pos={n_positive_folds}/{len(cv_folds)} | {fold_str}")
+            status = "✅" if test_ic > 0.02 else ("🔶" if test_ic > 0 else "❌")
+            print(f"  #{i:2d} {status} [{factor_str:20s}] Train={train_ic:.4f} | Test={test_ic:.4f} | IR={test_ir:.2f}")
 
-    # 6. CV 일관성 기반 최종 5개 선별 — 변수 조합 다양성 강제
-    #    같은 변수 조합(예: foreign_ownership+vol_ratio+amihud+close)은 최대 2개
-    #    → 나머지 3개는 반드시 다른 변수 조합이어야 함
+    # 6. Test IC 기준 정렬 + 변수 다양성 강제
     MAX_SAME_VARS = 2
-
-    tier1 = [a for a in all_candidates if a['n_positive_folds'] >= 3]
-    tier2 = [a for a in all_candidates if a['n_positive_folds'] >= 2 and a not in tier1]
-    tier3 = [a for a in all_candidates if a not in tier1 and a not in tier2]
-
-    tier1.sort(key=lambda x: (x['n_positive_folds'], x['mean_test_ic']), reverse=True)
-    tier2.sort(key=lambda x: x['mean_test_ic'], reverse=True)
-    tier3.sort(key=lambda x: x['mean_train_ic'], reverse=True)
-
-    ranked_candidates = tier1 + tier2 + tier3
+    all_candidates.sort(key=lambda x: x['test_ic'], reverse=True)
 
     validated_alphas = []
     var_sig_counts = {}
-    for a in ranked_candidates:
+    for a in all_candidates:
         sig = _get_variable_signature(a['expr'])
         count = var_sig_counts.get(sig, 0)
         if count < MAX_SAME_VARS:
@@ -1742,47 +1726,33 @@ def main():
 
     # 다양성 통계 출력
     unique_var_sigs = len(set(_get_variable_signature(a['expr']) for a in validated_alphas))
-    print(f"\n   🧬 변수 다양성: {unique_var_sigs}개 고유 변수 조합 / {len(validated_alphas)}개 알파 "
-          f"(같은 조합 최대 {MAX_SAME_VARS}개)")
-    for sig, cnt in sorted(var_sig_counts.items(), key=lambda x: -x[1]):
-        if cnt > 0:
-            var_list = sorted(sig)
-            print(f"      {cnt}개: {{{', '.join(var_list)}}}")
+    print(f"\n   🧬 변수 다양성: {unique_var_sigs}개 고유 변수 조합 / {len(validated_alphas)}개 알파")
 
     print("\n" + "=" * 80)
-    print("🏆 TOP 5 ALPHAS (CV-validated)")
+    print("🏆 TOP 5 ALPHAS (Test-validated)")
     print("=" * 80)
 
     for i, a in enumerate(validated_alphas, 1):
-        n_pos = a['n_positive_folds']
-        status = "✅" if n_pos >= 3 else ("🔶" if n_pos >= 2 else "⚠️")
-        fold_detail = ' '.join([f"{ic:+.3f}" for ic in a['fold_test_ics']])
-        print(f"\n  #{i} {status} (positive folds: {n_pos}/{len(cv_folds)})")
-        print(f"     Train IC: {a['mean_train_ic']:.4f} | Test IC: {a['mean_test_ic']:.4f} | "
-              f"Test IR: {a['mean_test_ir']:.2f} [{a['factors']}]")
-        print(f"     Fold ICs: [{fold_detail}]")
+        status = "✅" if a['test_ic'] > 0.02 else ("🔶" if a['test_ic'] > 0 else "❌")
+        print(f"\n  #{i} {status}")
+        print(f"     Train IC: {a['train_ic']:.4f} | Test IC: {a['test_ic']:.4f} | "
+              f"Test IR: {a['test_ir']:.2f} [{a['factors']}]")
         print(f"     {a['expr'][:100]}{'...' if len(a['expr']) > 100 else ''}")
 
     # 7. 최종 Best 선정
-    if tier1:
-        final_best = tier1[0]
-    elif tier2:
-        final_best = tier2[0]
-    else:
-        final_best = validated_alphas[0] if validated_alphas else {
-            'expr': best_alpha, 'mean_train_ic': best_ic, 'mean_test_ic': -999,
-            'mean_test_ir': -999, 'n_positive_folds': 0, 'fold_test_ics': [], 'factors': '?'
-        }
+    final_best = validated_alphas[0] if validated_alphas else {
+        'expr': best_alpha, 'train_ic': best_ic, 'test_ic': -999,
+        'test_ir': -999, 'factors': '?'
+    }
 
     print("\n" + "=" * 80)
-    print("🥇 FINAL BEST (CV-validated)")
+    print("🥇 FINAL BEST")
     print("=" * 80)
-    print(f"Mean Train IC:  {final_best['mean_train_ic']:.4f}")
-    print(f"Mean Test IC:   {final_best['mean_test_ic']:.4f}")
-    print(f"Mean Test IR:   {final_best['mean_test_ir']:.2f}")
-    print(f"Positive Folds: {final_best['n_positive_folds']}/{len(cv_folds)}")
-    print(f"Factors:        {final_best['factors']}")
-    print(f"Expression:     {final_best['expr']}")
+    print(f"Train IC:   {final_best['train_ic']:.4f}")
+    print(f"Test IC:    {final_best['test_ic']:.4f}")
+    print(f"Test IR:    {final_best['test_ir']:.2f}")
+    print(f"Factors:    {final_best['factors']}")
+    print(f"Expression: {final_best['expr']}")
 
     # 8. DB 저장 (Top-5 전부)
     print("\n💾 데이터베이스에 저장 중...")
@@ -1798,10 +1768,9 @@ def main():
                 SET ic_score = EXCLUDED.ic_score, updated_at = NOW()
             """, (
                 a['expr'],
-                float(a['mean_test_ic']),
-                f"20d fwd, train={a['mean_train_ic']:.4f}, test={a['mean_test_ic']:.4f}, "
-                f"IR={a['mean_test_ir']:.2f}, pos_folds={a['n_positive_folds']}/{len(cv_folds)}, "
-                f"{a['factors']}, v10-cogalpha-cv"
+                float(a['test_ic']),
+                f"20d fwd, train={a['train_ic']:.4f}, test={a['test_ic']:.4f}, "
+                f"IR={a['test_ir']:.2f}, {a['factors']}, v11-simple-split"
             ))
 
         conn.commit()
@@ -1816,9 +1785,9 @@ def main():
     for a in validated_alphas:
         alpha_export.append({
             'expression': a['expr'],
-            'mean_test_ic': float(a['mean_test_ic']),
-            'mean_test_ir': float(a['mean_test_ir']),
-            'n_positive_folds': a['n_positive_folds'],
+            'train_ic': float(a['train_ic']),
+            'test_ic': float(a['test_ic']),
+            'test_ir': float(a['test_ir']),
             'factors': a['factors'],
         })
 
@@ -1827,7 +1796,7 @@ def main():
         json.dump(alpha_export, f, indent=2, ensure_ascii=False)
     print(f"\n📁 Multi-Alpha Ensemble 내보내기: {export_path}")
     for i, ae in enumerate(alpha_export, 1):
-        print(f"   #{i} IC={ae['mean_test_ic']:.4f} IR={ae['mean_test_ir']:.2f} "
+        print(f"   #{i} IC={ae['test_ic']:.4f} IR={ae['test_ir']:.2f} "
               f"[{ae['factors']}] {ae['expression'][:80]}...")
 
     print("\n🎉 완료!")
