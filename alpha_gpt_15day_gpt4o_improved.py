@@ -204,17 +204,16 @@ def load_market_data():
 # ── CogAlpha-inspired: LLM-guided Mutation + Adaptive Feedback ──
 
 def _build_adaptive_feedback(raw_scores, prev_feedback=None):
-    """매 세대 top-2 성공 + bottom-2 실패를 CoT 분석하여 누적 피드백 생성.
+    """매 세대 top-3 성공 + bottom-3 실패를 CoT 분석하여 누적 피드백 생성.
 
-    CogAlpha 논문: "For each generation, we select the top two valid alphas and
-    the two worst-performing invalid alphas as guiding samples."
+    CogAlpha 논문 확장: 더 많은 샘플로 풍부한 패턴 학습.
     """
     valid = [(a, ic) for a, ic in raw_scores if ic > -999.0]
-    if len(valid) < 4:
+    if len(valid) < 6:
         return prev_feedback or ""
 
-    top2 = valid[:2]
-    bottom2 = valid[-2:]
+    top2 = valid[:3]
+    bottom2 = valid[-3:]
 
     # 팩터 분석 함수
     def _analyze_factors(expr):
@@ -236,7 +235,7 @@ def _build_adaptive_feedback(raw_scores, prev_feedback=None):
     def _extract_windows(expr):
         return [int(w) for w in re.findall(r',\s*(\d+)\)', expr)]
 
-    feedback = "### Generation Feedback (Top-2 vs Bottom-2 analysis)\n"
+    feedback = "### Generation Feedback (Top-3 vs Bottom-3 analysis)\n"
     feedback += "**Top performers this generation:**\n"
     for expr, ic in top2:
         factors = _analyze_factors(expr)
@@ -273,57 +272,67 @@ def _build_adaptive_feedback(raw_scores, prev_feedback=None):
         prev_lines = prev_feedback.strip().split('\n')
         # 이전 피드백에서 가장 중요한 인사이트만 유지
         kept = [l for l in prev_lines if l.startswith('**') or l.startswith('  - IC=')]
-        if len(kept) > 8:
-            kept = kept[:8]  # 최근 것만
+        if len(kept) > 12:
+            kept = kept[:12]  # 최근 것만 (더 긴 기억)
         feedback += "\n### Previous generation insights:\n" + '\n'.join(kept) + "\n"
 
     return feedback
 
 
-def _llm_guided_mutation(top_alphas, adaptive_feedback, num_mutations=10):
-    """CogAlpha-inspired LLM-guided mutation.
+def _llm_guided_mutation(top_alphas, adaptive_feedback, num_mutations=15):
+    """CogAlpha-inspired LLM-guided mutation (v11 — 7 Diversification Modes).
 
     랜덤 변이 대신 GPT-4o가 금융 로직을 이해하면서 변이 수행.
-    5가지 Diversification Guidance Mode 적용:
-    - Light: 윈도우만 미세 조정
-    - Moderate: 연산자 교체 + 윈도우 조정
-    - Creative: 새 변수 조합 탐색
-    - Divergent: 완전히 다른 접근법
-    - Concrete: 수치 기반 정밀 조정
+    7가지 Diversification Guidance Mode + 모드별 차등 temperature 적용.
     """
     try:
         client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     except Exception:
         return []
 
-    # Top 알파들을 분석용 텍스트로 변환
+    # Top 알파들을 분석용 텍스트로 변환 (더 넓은 부모 풀)
     parent_block = ""
-    for i, (expr, ic) in enumerate(top_alphas[:5], 1):
+    for i, (expr, ic) in enumerate(top_alphas[:8], 1):
         parent_block += f"  Parent #{i} (IC={ic:.4f}): `{expr}`\n"
 
-    prompt = f"""### Task: Intelligent Alpha Mutation
+    prompt = f"""### Task: Intelligent Alpha Mutation (7-Mode Diversity Expansion)
 You are an expert quant researcher performing **guided mutation** on high-performing alpha expressions.
 Unlike random mutation, you understand the financial logic behind each expression and make targeted improvements.
+Your goal is to MAXIMIZE DIVERSITY — each mutation should explore a meaningfully different region of alpha space.
 
 ### Parent Alphas (these already work well — improve them):
 {parent_block}
 {adaptive_feedback}
-### Mutation Guidance Modes (apply ALL 5 modes, {num_mutations} total mutations):
+### Mutation Guidance Modes (apply ALL 7 modes, {num_mutations} total mutations):
 
 **Mode 1 - Light** (2 mutations): Fine-tune lookback windows only. If a parent uses ts_mean(x, 5), try 8 or 10.
-  Consider: Monthly rebalancing (20d) favors medium-to-long windows (10-120d).
+  Consider: Monthly rebalancing (20d) favors medium-to-long windows (10-150d).
 
 **Mode 2 - Moderate** (2 mutations): Replace operators with similar ones (e.g., ts_mean→ts_ema, ts_median→ts_decayed_linear).
   Keep the same financial logic but change computation method.
 
-**Mode 3 - Creative** (2 mutations): Add a new variable to an existing parent.
-  Example: If parent uses amihud/close_MA, add a volume or flow component.
+**Mode 3 - Creative** (2 mutations): Add a COMPLETELY NEW variable to an existing parent.
+  Example: If parent uses amihud/close_MA, add inst_net_ratio or gap or atr_ratio.
+  IMPORTANT: Use variables NOT already present in the parent.
 
-**Mode 4 - Divergent** (2 mutations): Combine building blocks from 2 different parents into a new alpha.
-  Example: Take the numerator structure from Parent #1 and the normalization from Parent #3.
+**Mode 4 - Divergent** (2 mutations): Combine building blocks from 2+ DISTANT parents into a new alpha.
+  Example: Take the numerator structure from Parent #1 and the normalization from Parent #6.
+  Choose parents that are structurally MOST different from each other.
 
 **Mode 5 - Concrete** (2 mutations): Create a precise refinement based on the feedback analysis.
   If feedback says "flow variables win", create a new flow-centric combination.
+
+**Mode 6 - Orthogonal** (2 mutations): Use `ops.ts_regression_residual(y, x, window)` to create signals
+  that are ORTHOGONAL to existing parents. Extract what existing alphas CANNOT explain.
+  Example: `ops.normed_rank(ops.ts_regression_residual(returns, vol_ratio, 20))` = returns unexplained by volume
+  Example: `ops.zscore_scale(ops.ts_regression_residual(close, foreign_net_ratio, 30))` = price moves unexplained by foreign flow
+
+**Mode 7 - Conditional** (1 mutation): Use `ops.sign()`, `ops.greater()`, or `ops.relu()` to create
+  regime-conditional alphas that behave differently in different market states.
+  Example: `ops.normed_rank(ops.cwise_mul(ops.sign(ops.ts_delta(close, 20)), ops.ts_ir(returns, 10)))` = momentum direction × IR
+  Example: `ops.normed_rank(ops.cwise_mul(ops.relu(ops.ts_delta_ratio(close, 15)), ops.div(amihud, ops.ts_mean(amihud, 60))))` = only positive momentum × illiquidity
+
+**+ 2 Bonus mutations**: Your most creative ideas combining ANY of the above modes.
 
 ### Available Data (21 variables)
 close, open_price, high, low, volume, returns, vwap, high_low_range, body, upper_shadow, lower_shadow,
@@ -342,28 +351,30 @@ Conditional: sign(x), relu(x), greater(x, y)
 - Wrap every alpha with `ops.normed_rank()` or `ops.zscore_scale()`
 - Use `ops.` prefix for ALL operators
 - Use 2+ lookback windows (multi-timeframe)
-- Complexity: 2~4 nesting levels
-- Window range: 5~120
+- Complexity: 2~5 nesting levels
+- Window range: 3~150 (explore extreme short/long windows)
 - Try using ts_regression_residual for orthogonal signals
+- MAXIMIZE DIVERSITY: each mutation should use DIFFERENT variable combinations
 
 ### Output Format
 {{"mutations": [
-  {{"mode": "Light|Moderate|Creative|Divergent|Concrete",
+  {{"mode": "Light|Moderate|Creative|Divergent|Concrete|Orthogonal|Conditional",
     "parent_id": 1,
     "reasoning": "Why this mutation improves the parent",
     "expression": "ops.normed_rank(...)"}}
 ]}}
 
-**CRITICAL**: Return exactly {num_mutations} mutations with valid ops.xxx() expressions."""
+**CRITICAL**: Return exactly {num_mutations} mutations with valid ops.xxx() expressions.
+Modes 3,4,6,7 should be BOLD and explore novel territory — don't play it safe."""
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are an expert quantitative alpha researcher performing intelligent guided mutation on financial alpha expressions. Return your response as a valid JSON object."},
+                {"role": "system", "content": "You are an expert quantitative alpha researcher performing intelligent guided mutation on financial alpha expressions. Prioritize DIVERSITY over incremental improvement. Return your response as a valid JSON object."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,
+            temperature=0.7,
             max_tokens=8000,
             response_format={"type": "json_object"}
         )
@@ -406,10 +417,11 @@ Conditional: sign(x), relu(x), greater(x, y)
         return []
 
 
-def _llm_guided_crossover(top_alphas, adaptive_feedback, num_children=5):
-    """CogAlpha-inspired LLM-guided crossover.
+def _llm_guided_crossover(top_alphas, adaptive_feedback, num_children=8):
+    """CogAlpha-inspired LLM-guided crossover (v11 — 더 넓은 부모 풀 + 원거리 교차).
 
     두 부모 알파의 금융 로직을 이해하고 의미있는 교차를 수행.
+    더 먼 부모 간 교차로 다양성 극대화.
     """
     try:
         client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -417,7 +429,7 @@ def _llm_guided_crossover(top_alphas, adaptive_feedback, num_children=5):
         return []
 
     parent_block = ""
-    for i, (expr, ic) in enumerate(top_alphas[:6], 1):
+    for i, (expr, ic) in enumerate(top_alphas[:10], 1):
         parent_block += f"  Parent #{i} (IC={ic:.4f}): `{expr}`\n"
 
     prompt = f"""### Task: Intelligent Alpha Crossover
@@ -428,35 +440,37 @@ Combine building blocks from multiple parent alphas to create novel offspring.
 {adaptive_feedback}
 ### Crossover Strategy
 For each offspring:
-1. Select 2 parents
+1. Select 2 parents — PREFER DISTANT parents (e.g., #1 × #8, not #1 × #2) for maximum novelty
 2. Identify the "winning component" from each (e.g., the numerator logic, the normalization method, the variable selection)
 3. Combine them into a new alpha that inherits strengths from both parents
 4. Explain WHY this combination should work
+5. At least 2 crossovers should use ts_regression_residual or conditional operators (sign/greater/relu)
 
 ### Rules
 - Wrap with `ops.normed_rank()` or `ops.zscore_scale()`
 - Use `ops.` prefix for ALL operators
-- 2+ lookback windows, 2~4 nesting levels
-- Window range: 5~120
+- 2+ lookback windows, 2~5 nesting levels
+- Window range: 3~150
+- MAXIMIZE the number of UNIQUE variable combinations across offspring
 
 ### Output Format
 {{"crossovers": [
-  {{"parent1_id": 1, "parent2_id": 3,
+  {{"parent1_id": 1, "parent2_id": 8,
     "reasoning": "Combines X's liquidity signal with Y's flow signal",
     "expression": "ops.normed_rank(...)"}}
 ]}}
 
-Generate exactly {num_children} crossover offspring."""
+Generate exactly {num_children} crossover offspring. Each MUST use a different variable combination."""
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are an expert quantitative alpha researcher performing intelligent crossover on financial alpha expressions. Return your response as a valid JSON object."},
+                {"role": "system", "content": "You are an expert quantitative alpha researcher performing intelligent crossover on financial alpha expressions. Prioritize DISTANT parent combinations for maximum novelty. Return your response as a valid JSON object."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,
-            max_tokens=6000,
+            temperature=0.6,
+            max_tokens=8000,
             response_format={"type": "json_object"}
         )
 
@@ -513,8 +527,8 @@ def _load_previous_results():
     return [], []
 
 
-def generate_seed_alphas_gpt4o(num_seeds=20):
-    """2단계 시드 생성: (1) 가설 생성 → (2) 가설 기반 알파 생성 + 이전 결과 피드백"""
+def generate_seed_alphas_gpt4o(num_seeds=30):
+    """2단계 시드 생성: (1) 가설 10개 생성 → (2) 가설 기반 알파 생성 + 이전 결과 피드백"""
     print(f"\n🤖 GPT-4o 2단계 시드 생성 (가설→알파, {num_seeds}개)...")
 
     client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -541,9 +555,9 @@ def generate_seed_alphas_gpt4o(num_seeds=20):
         feedback_block += "Explore NEW combinations of successful building blocks (MA slope, amihud, lower_shadow, vwap).\n"
         print(f"   이전 결과 피드백: best {len(prev_best)}개, worst {len(prev_worst)}개")
 
-    # ── 1단계: 가설 생성 (temperature=0.3, 집중된 추론) ──
+    # ── 1단계: 가설 생성 (temperature=0.5, 다양한 가설) ──
     print("   [1/2] 가설 생성 중...")
-    hypothesis_prompt = f"""You are a quantitative finance researcher. Generate 6 structured trading hypotheses
+    hypothesis_prompt = f"""You are a quantitative finance researcher. Generate 10 structured trading hypotheses
 for a **20-day (1-month) holding period** strategy in the Korean stock market (KRX).
 
 Each hypothesis must follow this EXACT JSON format:
@@ -556,7 +570,7 @@ Each hypothesis must follow this EXACT JSON format:
   }}
 ]}}
 
-Generate EXACTLY 6 hypotheses, one per theme:
+Generate EXACTLY 10 hypotheses, one per theme:
 1. **Momentum + Volume confirmation**: Price trend confirmed by trading activity pattern
 2. **Volatility regime + Mean-reversion**: Candle body/shadow patterns predicting reversals
 3. **Liquidity premium**: Amihud illiquidity ratio combined with price structure
@@ -564,6 +578,14 @@ Generate EXACTLY 6 hypotheses, one per theme:
 5. **Cross-variable decorrelation**: Using ts_regression_residual to extract orthogonal signals
    (e.g., returns not explained by volume, price moves not explained by flow)
 6. **Microstructure signals**: Gap, intraday returns, candle shape as information signals
+7. **Institutional flow momentum**: 기관/외국인 순매수 추세가 가격에 선행하는 패턴
+   (foreign_net_ratio, inst_net_ratio의 누적 흐름이 향후 수익률을 예측)
+8. **Volatility compression breakout**: ATR 수축 후 확장 → 추세 시작 신호
+   (atr_ratio가 낮아졌다가 높아지는 종목이 20일 후 수익률 높음)
+9. **Turnover anomaly**: 거래대금(amount) 기반 유동성 프리미엄
+   (거래대금 변화율과 가격 모멘텀의 비선형 관계)
+10. **Regime-conditional alpha**: 변동성 레짐에 따라 다른 신호 적용
+    (sign/greater 조건 연산자로 고변동성 vs 저변동성 구간 분기)
 {feedback_block}
 Available data: close, open_price, high, low, volume, returns, vwap, high_low_range, body,
 upper_shadow, lower_shadow, atr_ratio, amount, amihud, gap, intraday_ret, vol_ratio,
@@ -576,8 +598,8 @@ foreign_net_ratio, inst_net_ratio, retail_net_ratio, foreign_ownership_pct"""
                 {"role": "system", "content": "You are an expert quantitative researcher specializing in KRX alpha factor hypothesis generation."},
                 {"role": "user", "content": hypothesis_prompt}
             ],
-            temperature=0.3,
-            max_tokens=4000,
+            temperature=0.5,
+            max_tokens=6000,
             response_format={"type": "json_object"}
         )
         hyp_content = hyp_response.choices[0].message.content
@@ -604,27 +626,35 @@ foreign_net_ratio, inst_net_ratio, retail_net_ratio, foreign_ownership_pct"""
              "knowledge": "If stock returns are high but not explained by volume, then alpha persists for 20 days"},
             {"hypothesis": "Overnight gap + intraday reversal patterns predict next month",
              "knowledge": "If gap and intraday return diverge, then price corrects within 20 trading days"},
+            {"hypothesis": "Institutional flow momentum leads price by 1-4 weeks",
+             "knowledge": "If foreign_net_ratio or inst_net_ratio accumulates over 10-20 days, then price follows within 20 trading days"},
+            {"hypothesis": "Volatility compression followed by expansion signals breakout",
+             "knowledge": "If atr_ratio contracts then expands, then directional move occurs within 20 trading days"},
+            {"hypothesis": "Trading amount anomalies predict liquidity-driven returns",
+             "knowledge": "If amount surges relative to history while price is flat, then price catches up within 20 days"},
+            {"hypothesis": "Regime-conditional signals: different alphas work in different volatility regimes",
+             "knowledge": "If market volatility is low, momentum works; if high, mean-reversion works over 20 days"},
         ]
 
-    # ── 2단계: 가설 기반 알파 생성 (temperature=0.5, 다양성 극대화) ──
+    # ── 2단계: 가설 기반 알파 생성 (temperature=0.7, 다양성 극대화) ──
     print("   [2/2] 가설 기반 알파 생성 중...")
     hypotheses_text = ""
-    for i, h in enumerate(hypotheses[:6], 1):
+    for i, h in enumerate(hypotheses[:10], 1):
         hyp = h.get('hypothesis', '') or h.get('reason', '')
         knowledge = h.get('knowledge', '') or h.get('concise_knowledge', '')
         hypotheses_text += f"\n**Hypothesis {i}**: {hyp}\n"
         if knowledge:
             hypotheses_text += f"  Knowledge: {knowledge}\n"
 
-    alphas_per_hyp = num_seeds // 6
-    remaining = num_seeds - alphas_per_hyp * 6
+    alphas_per_hyp = num_seeds // 10
+    remaining = num_seeds - alphas_per_hyp * 10
 
     prompt = f"""### Task
 Generate {num_seeds} diverse alpha expressions for **20-day (1-month) forward returns** in KRX.
 Each alpha MUST be grounded in one of the hypotheses below.
 {hypotheses_text}
 ### Alpha Generation Rules
-- Generate {alphas_per_hyp} alphas per hypothesis ({alphas_per_hyp}×6 = {alphas_per_hyp*6}), plus {remaining} bonus composite alphas.
+- Generate {alphas_per_hyp} alphas per hypothesis ({alphas_per_hyp}×10 = {alphas_per_hyp*10}), plus {remaining} bonus composite alphas.
 - Each alpha MUST reference which hypothesis (1-6) it implements.
 {feedback_block}
 
@@ -690,7 +720,7 @@ Conditional: sign(x) — returns -1/0/+1, relu(x) — max(0, x), greater(x, y) �
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.5,
+        temperature=0.7,
         max_tokens=16000,
         response_format={"type": "json_object"}
     )
@@ -1063,6 +1093,7 @@ OPERATOR_SWAP_GROUPS = [
     ['ts_max_diff', 'ts_min_diff'],
     ['normed_rank', 'zscore_scale'],
     ['cwise_mul', 'add', 'minus'],
+    ['ts_corr', 'ts_regression_residual'],  # 2-var 연산자 교환
 ]
 
 OPERAND_POOL = ['close', 'open_price', 'high', 'low', 'volume', 'returns', 'vwap', 'high_low_range', 'body',
@@ -1070,11 +1101,12 @@ OPERAND_POOL = ['close', 'open_price', 'high', 'low', 'volume', 'returns', 'vwap
                 'foreign_net_ratio', 'inst_net_ratio', 'retail_net_ratio', 'foreign_ownership_pct']
 
 def mutate_alpha(alpha_expr):
-    """알파 변이 — 4가지 타입: 윈도우(25%), 연산자(25%), 피연산자(25%), 구조(25%)"""
+    """알파 변이 — 4가지 타입: 윈도우(20%), 연산자(20%), 피연산자(30%), 구조(30%)
+    피연산자와 구조 변이 비중을 높여 더 다양한 변수/구조 조합 탐색."""
     try:
         mutation_type = random.choices(
             ['window', 'operator', 'operand', 'structural'],
-            weights=[0.25, 0.25, 0.25, 0.25]
+            weights=[0.20, 0.20, 0.30, 0.30]
         )[0]
 
         if mutation_type == 'window':
@@ -1089,7 +1121,7 @@ def mutate_alpha(alpha_expr):
         return None
 
 def _mutate_window(alpha_expr):
-    """윈도우 파라미터 변경 (범위 5~120, MA 장기 시그널 지원)"""
+    """윈도우 파라미터 변경 (범위 3~150, 극단적 단기/장기 탐색 포함)"""
     matches = list(re.finditer(r'(ts_\w+|shift)\([^,]+,\s*(\d+)\)', alpha_expr))
     if not matches:
         return None
@@ -1097,14 +1129,14 @@ def _mutate_window(alpha_expr):
     old_window = int(match.group(2))
     # 현재 윈도우 크기에 따라 변이 폭 조절 (비례적 변이)
     if old_window <= 20:
-        deltas = [-5, -3, -2, 2, 3, 5, 7, 10, 15]
+        deltas = [-7, -5, -3, -2, 2, 3, 5, 7, 10, 15, 20]
     elif old_window <= 60:
-        deltas = [-15, -10, -7, -5, 5, 7, 10, 15, 20, 30]
+        deltas = [-20, -15, -10, -7, -5, 5, 7, 10, 15, 20, 30, 40]
     else:
-        deltas = [-30, -20, -10, 10, 20, 30]
-    new_window = max(5, min(120, old_window + random.choice(deltas)))
+        deltas = [-40, -30, -20, -10, 10, 20, 30, 40]
+    new_window = max(3, min(150, old_window + random.choice(deltas)))
     if new_window == old_window:
-        new_window = max(5, min(120, old_window + random.choice([-20, 20])))
+        new_window = max(3, min(150, old_window + random.choice([-25, 25])))
     start, end = match.span(2)
     return alpha_expr[:start] + str(new_window) + alpha_expr[end:]
 
@@ -1159,7 +1191,7 @@ def _mutate_structural(alpha_expr):
     structural_type = random.choices(
         ['ts_corr_new', 'ts_corr_add', 'sign_filter', 'relu_clip',
          'regression_residual', 'rank_divergence'],
-        weights=[0.20, 0.15, 0.15, 0.10, 0.25, 0.15]
+        weights=[0.15, 0.15, 0.15, 0.15, 0.25, 0.15]
     )[0]
 
     def _unwrap(expr):
@@ -1334,7 +1366,7 @@ def _tournament_select(fitness_scores, tournament_size=5):
     return max(candidates, key=lambda x: x[1])[0]
 
 
-def _fitness_sharing(fitness_scores, sharing_radius=0.8):
+def _fitness_sharing(fitness_scores, sharing_radius=1.0):
     """적합도 공유 — 구조 + 변수 조합 2단계 니쉬 페널티로 다양성 보존.
 
     Level 1: 같은 구조(operator+variable, window 제외) → 강한 페널티
@@ -1363,11 +1395,11 @@ def _fitness_sharing(fitness_scores, sharing_radius=0.8):
         for alpha, ic in members:
             # 구조 니쉬 페널티
             penalty = 1.0 + sharing_radius * (struct_niche - 1)
-            # 변수 조합 니쉬 페널티 (같은 변수 조합이 10개 이상이면 추가 감점)
+            # 변수 조합 니쉬 페널티 (같은 변수 조합이 8개 이상이면 추가 감점)
             var_sig = _get_variable_signature(alpha)
             var_count = var_sigs.get(var_sig, 1)
-            if var_count > 10:
-                penalty += 0.3 * (var_count - 10) / 10  # 점진적 추가 페널티
+            if var_count > 8:
+                penalty += 0.3 * (var_count - 8) / 8  # 점진적 추가 페널티 (조기 발동)
             shared_ic = ic / penalty
             shared.append((alpha, shared_ic))
 
@@ -1375,17 +1407,17 @@ def _fitness_sharing(fitness_scores, sharing_radius=0.8):
 
 
 def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date=None,
-                        generations=50, population_size=200):
-    """병렬 GP v10 — CogAlpha-inspired: LLM-guided mutation + adaptive feedback"""
+                        generations=70, population_size=300):
+    """병렬 GP v11 — CogAlpha-inspired: LLM-guided mutation + adaptive feedback + 다양성 극대화"""
 
     close_idx = data['close'].index
-    print(f"\n🧬 병렬 GP 시작 (v10 — CogAlpha: LLM-guided mutation + adaptive feedback)")
+    print(f"\n🧬 병렬 GP 시작 (v11 — CogAlpha: LLM-guided + diversity expansion)")
     if train_end_date is not None:
         print(f"   Train IC range: {train_start_date or close_idx[0]} ~ {train_end_date}")
     else:
         print(f"   Train IC range: full data")
     print(f"   Seed: {len(seed_alphas)}개, 세대: {generations}, 개체수: {population_size}, 워커: 8")
-    print(f"   LLM mutation: 매 5세대, LLM crossover: 매 8세대")
+    print(f"   LLM mutation: 매 3세대, LLM crossover: 매 5세대")
 
     population = seed_alphas[:population_size]
     while len(population) < population_size:
@@ -1404,16 +1436,16 @@ def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date
     adaptive_feedback = ""
     llm_injection_count = 0
 
-    elite_count = max(5, population_size // 14)  # 7% 엘리트 (수렴 지연)
-    base_mutation_rate = 0.45  # 기본 변이율
+    elite_count = max(5, population_size // 20)  # 5% 엘리트 (다양성 우선)
+    base_mutation_rate = 0.50  # 기본 변이율 (탐색 비중 강화)
 
-    # LLM mutation/crossover 주기 (CogAlpha: 매 2세대, 우리는 비용 효율상 5세대)
-    LLM_MUTATION_INTERVAL = 5
-    LLM_CROSSOVER_INTERVAL = 8
+    # LLM mutation/crossover 주기 (더 빈번한 LLM 개입으로 다양성 극대화)
+    LLM_MUTATION_INTERVAL = 3
+    LLM_CROSSOVER_INTERVAL = 5
 
     for gen in range(1, generations + 1):
         # 적응적 변이율: 정체 시 변이 비중 증가
-        mutation_rate = min(0.7, base_mutation_rate + stagnation_count * 0.05)
+        mutation_rate = min(0.80, base_mutation_rate + stagnation_count * 0.05)
         crossover_rate = 1.0 - mutation_rate
 
         print(f"\n  세대 {gen}/{generations} (변이율: {mutation_rate:.0%}, 정체: {stagnation_count})")
@@ -1444,15 +1476,15 @@ def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date
             stagnation_count += 1
 
         # 이민(immigration): 정체 시 LLM-guided 개체 주입 (CogAlpha 스타일)
-        if stagnation_count >= 5 and immigration_count < 3:
+        if stagnation_count >= 4 and immigration_count < 5:
             immigration_count += 1
             stagnation_count = 0
-            n_immigrants = population_size // 4  # 25% 교체
+            n_immigrants = int(population_size * 0.30)  # 30% 교체
             print(f"    🌍 이민 #{immigration_count}: {n_immigrants}개 새 개체 주입 (LLM-guided)")
 
             # CogAlpha 개선: 이민 시 LLM mutation + 랜덤 mutation 혼합
             top_for_llm = [(a, ic) for a, ic in raw_scores[:10] if ic > -999.0]
-            llm_immigrants = _llm_guided_mutation(top_for_llm, adaptive_feedback, num_mutations=min(10, n_immigrants // 3))
+            llm_immigrants = _llm_guided_mutation(top_for_llm, adaptive_feedback, num_mutations=min(15, n_immigrants // 3))
             if llm_immigrants:
                 print(f"      🤖 LLM mutation: {len(llm_immigrants)}개 생성")
                 llm_injection_count += len(llm_immigrants)
@@ -1474,8 +1506,8 @@ def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date
             continue
 
         # 최종 종료: 이민 3회 후에도 5세대 무개선
-        if stagnation_count >= 5:
-            print(f"    ⏹️  이민 {immigration_count}회 후 5세대 무개선 → 종료")
+        if stagnation_count >= 4:
+            print(f"    ⏹️  이민 {immigration_count}회 후 4세대 무개선 → 종료")
             break
 
         # ── CogAlpha: 주기적 LLM-guided Mutation 주입 ──
@@ -1483,7 +1515,7 @@ def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date
         if gen % LLM_MUTATION_INTERVAL == 0:
             top_for_llm = [(a, ic) for a, ic in raw_scores[:10] if ic > -999.0]
             print(f"    🤖 LLM-guided mutation (세대 {gen})...")
-            llm_mutated = _llm_guided_mutation(top_for_llm, adaptive_feedback, num_mutations=10)
+            llm_mutated = _llm_guided_mutation(top_for_llm, adaptive_feedback, num_mutations=15)
             if llm_mutated:
                 llm_offspring.extend(llm_mutated)
                 llm_injection_count += len(llm_mutated)
@@ -1493,7 +1525,7 @@ def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date
         if gen % LLM_CROSSOVER_INTERVAL == 0:
             top_for_llm = [(a, ic) for a, ic in raw_scores[:10] if ic > -999.0]
             print(f"    🤖 LLM-guided crossover (세대 {gen})...")
-            llm_crossed = _llm_guided_crossover(top_for_llm, adaptive_feedback, num_children=5)
+            llm_crossed = _llm_guided_crossover(top_for_llm, adaptive_feedback, num_children=8)
             if llm_crossed:
                 llm_offspring.extend(llm_crossed)
                 llm_injection_count += len(llm_crossed)
@@ -1538,7 +1570,7 @@ def genetic_programming(seed_alphas, data, train_start_date=None, train_end_date
     print(f"\n    📊 LLM 주입 총계: {llm_injection_count}개 (mutation + crossover)")
 
     # Top-20 다양한 알파 선택 (main에서 val/test IC로 최종 5개 선택)
-    top_diverse = _select_diverse_top_n(all_results_history, n=20)
+    top_diverse = _select_diverse_top_n(all_results_history, n=30)
 
     # Proven seeds 항상 최종 후보에 포함 (GP에서 탈락해도 main()에서 재평가)
     existing_exprs = {a for a, _ in top_diverse}
@@ -1613,8 +1645,8 @@ def main():
         full_data,
         train_start_date=None,
         train_end_date=gp_train_end,
-        generations=50,
-        population_size=200
+        generations=70,
+        population_size=300
     )
 
     # 5. Top 후보를 모든 CV fold에서 평가
