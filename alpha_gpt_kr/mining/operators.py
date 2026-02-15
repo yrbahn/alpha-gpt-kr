@@ -107,10 +107,12 @@ class AlphaOperators:
     
     @staticmethod
     def ts_zscore_scale(x: pd.DataFrame, window: int = 10) -> pd.DataFrame:
-        """이동 윈도우 내에서 Z-score 정규화"""
+        """이동 윈도우 내에서 Z-score 정규화 (std=0이면 0 반환)"""
         mean = x.rolling(window=window, min_periods=1).mean()
         std = x.rolling(window=window, min_periods=1).std()
-        return (x - mean) / std.replace(0, np.nan)
+        # std=0 (상수 시계열)이면 NaN 대신 0 반환 — rank 변수 등에서 발생
+        result = (x - mean) / std.replace(0, np.nan)
+        return result.fillna(0.0)
     
     @staticmethod
     def ts_maxmin_scale(x: pd.DataFrame, window: int = 10) -> pd.DataFrame:
@@ -189,15 +191,47 @@ class AlphaOperators:
     def ts_median(x: pd.DataFrame, window: int = 10) -> pd.DataFrame:
         """이동 중앙값"""
         return x.rolling(window=window, min_periods=1).median()
-    
+
+    @staticmethod
+    def ts_regression_residual(y: pd.DataFrame, x: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+        """Rolling OLS residual: y - (beta*x + alpha).
+
+        y에서 x로 설명되지 않는 부분(잔차)을 추출.
+        예: ts_regression_residual(returns, vol_ratio, 20) = 거래량으로 설명 안 되는 수익률.
+        Vectorized rolling sums로 빠르게 계산.
+        """
+        min_obs = max(5, window // 2)
+        xy = x * y
+        xx = x * x
+
+        sum_x = x.rolling(window=window, min_periods=min_obs).sum()
+        sum_y = y.rolling(window=window, min_periods=min_obs).sum()
+        sum_xy = xy.rolling(window=window, min_periods=min_obs).sum()
+        sum_xx = xx.rolling(window=window, min_periods=min_obs).sum()
+        n = x.rolling(window=window, min_periods=min_obs).count()
+
+        denom = n * sum_xx - sum_x ** 2
+        denom = denom.replace(0, np.nan)
+
+        beta = (n * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - beta * sum_x) / n.replace(0, np.nan)
+
+        residual = y - beta * x - intercept
+        return residual.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     # ============================================
     # Cross-sectional Operators
     # ============================================
     
     @staticmethod
     def zscore_scale(x: pd.DataFrame) -> pd.DataFrame:
-        """횡단면 Z-score 정규화 (각 시점별)"""
-        return x.apply(lambda row: (row - row.mean()) / row.std(), axis=1)
+        """횡단면 Z-score 정규화 (각 시점별, std=0이면 0 반환)"""
+        def _zscore_row(row):
+            s = row.std()
+            if s == 0 or np.isnan(s):
+                return row * 0.0
+            return (row - row.mean()) / s
+        return x.apply(_zscore_row, axis=1)
     
     @staticmethod
     def winsorize_scale(x: pd.DataFrame, lower: float = 0.05, upper: float = 0.95) -> pd.DataFrame:
@@ -387,11 +421,20 @@ class AlphaOperators:
     
     @staticmethod
     def div(x: pd.DataFrame, y: Union[pd.DataFrame, float]) -> pd.DataFrame:
-        """나눗셈 (0으로 나누기 방지)"""
+        """나눗셈 (0으로 나누면 0 반환 — NaN 전파 방지)
+
+        alpha 표현식에서 div-by-zero는 해당 항의 "의미 없음"을 뜻하므로
+        NaN(전체 식 파괴) 대신 0(해당 항만 무효화)이 안전.
+        """
         if isinstance(y, pd.DataFrame):
-            return x / y.replace(0, np.nan)
+            safe_y = y.replace(0, np.nan)
+            result = x / safe_y
+            # inf/NaN → 0: 전파 방지
+            return result.fillna(0.0).replace([np.inf, -np.inf], 0.0)
         else:
-            return x / y if y != 0 else x * np.nan
+            if y == 0:
+                return x * 0.0
+            return x / y
     
     @staticmethod
     def greater(x: pd.DataFrame, y: Union[pd.DataFrame, float]) -> pd.DataFrame:

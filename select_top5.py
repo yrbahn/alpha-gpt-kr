@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-앙상블 알파로 상위 5종목 선정
-v3 가격 (50%) + v6 재무 추세 (50%)
-- v3: 모멘텀 × 거래량 안정성 × 가격 레인지 (Test IC 0.0371)
-- v6: 영업이익 추세 + YoY + QoQ 개선 (Test IC 0.0331)
-- 앙상블: Test IC 0.0461 (+24% 개선)
+앙상블 알파로 상위 5종목 선정 (20영업일 = 1달 리밸런싱)
+v11 Multi-Alpha Ensemble (60%) + v6 재무 추세 (40%)
+- Tech: best_alphas.json에서 CV-검증된 상위 N개 알파를 IC-weighted 앙상블
+- v6: 영업이익 추세 + YoY + QoQ 개선
+- 장점: 단일 알파 대비 분산 감소, 안정성 증가 (overfitting 방지)
 """
 
 import sys
@@ -61,7 +61,7 @@ ticker_mcap = dict(zip(stocks_df['ticker'], stocks_df['market_cap']))
 id_ticker = dict(zip(stocks_df['id'], stocks_df['ticker']))
 
 price_df = pd.read_sql(f"""
-    SELECT s.ticker, p.date, p.close, p.volume
+    SELECT s.ticker, p.date, p.open, p.high, p.low, p.close, p.volume
     FROM price_data p
     JOIN stocks s ON p.stock_id = s.id
     WHERE p.stock_id IN ({stock_id_list})
@@ -69,9 +69,34 @@ price_df = pd.read_sql(f"""
     ORDER BY s.ticker, p.date
 """, conn)
 
+open_price = price_df.pivot(index='date', columns='ticker', values='open')
+high = price_df.pivot(index='date', columns='ticker', values='high')
+low = price_df.pivot(index='date', columns='ticker', values='low')
 close = price_df.pivot(index='date', columns='ticker', values='close')
 volume = price_df.pivot(index='date', columns='ticker', values='volume')
 returns = close.pct_change()
+
+# 수급 데이터 로드
+print("   수급 데이터 로드 중...")
+try:
+    flow_df = pd.read_sql(f"""
+        SELECT s.ticker, sd.date,
+               sd.foreign_net_buy, sd.institution_net_buy,
+               sd.individual_net_buy, sd.foreign_ownership
+        FROM supply_demand_data sd
+        JOIN stocks s ON sd.stock_id = s.id
+        WHERE sd.stock_id IN ({stock_id_list})
+        AND sd.date >= CURRENT_DATE - INTERVAL '730 days'
+        ORDER BY s.ticker, sd.date
+    """, conn)
+    foreign_buy_raw = flow_df.pivot(index='date', columns='ticker', values='foreign_net_buy')
+    inst_buy_raw = flow_df.pivot(index='date', columns='ticker', values='institution_net_buy')
+    retail_buy_raw = flow_df.pivot(index='date', columns='ticker', values='individual_net_buy')
+    foreign_own_raw = flow_df.pivot(index='date', columns='ticker', values='foreign_ownership')
+    has_flow = True
+except Exception as e:
+    print(f"   ⚠️ 수급 데이터 로드 실패: {e}")
+    has_flow = False
 
 # 재무 추세 데이터
 print("   재무 추세 데이터 로드 중...")
@@ -197,20 +222,104 @@ oi_trend_rank = trend_vars.get('oi_trend_rank', _empty)
 oi_yoy_rank = trend_vars.get('oi_yoy_rank', _empty)
 oi_qoq_rank = trend_vars.get('oi_qoq_rank', _empty)
 
+# ── 파생 기술 지표 (21개 전체 — multi-alpha ensemble용) ──
+vwap = (high + low + close) / 3
+high_low_range = (high - low) / close
+body = (close - open_price) / open_price
+upper_shadow = (high - close.clip(lower=open_price)) / close
+lower_shadow = (close.clip(upper=open_price) - low) / close
+
+tr1 = high - low
+tr2 = (high - close.shift(1)).abs()
+tr3 = (low - close.shift(1)).abs()
+true_range = pd.concat([tr1, tr2, tr3]).groupby(level=0).max()
+true_range = true_range.reindex(close.index)
+atr_ratio = true_range / close
+
+amount = close * volume
+amihud = returns.abs() / amount.replace(0, np.nan)
+amihud = amihud.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+gap = open_price / close.shift(1) - 1
+intraday_ret = close / open_price - 1
+
+vol_ratio = volume / volume.rolling(20, min_periods=5).mean()
+vol_ratio = vol_ratio.replace([np.inf, -np.inf], np.nan).fillna(1)
+
+# 수급 비율 계산
+if has_flow:
+    foreign_buy_raw = foreign_buy_raw.reindex(index=close.index, columns=close.columns)
+    inst_buy_raw = inst_buy_raw.reindex(index=close.index, columns=close.columns)
+    retail_buy_raw = retail_buy_raw.reindex(index=close.index, columns=close.columns)
+    foreign_own_raw = foreign_own_raw.reindex(index=close.index, columns=close.columns)
+    safe_volume = volume.replace(0, np.nan)
+    foreign_net_ratio = (foreign_buy_raw / safe_volume).clip(-1, 1).fillna(0)
+    inst_net_ratio = (inst_buy_raw / safe_volume).clip(-1, 1).fillna(0)
+    retail_net_ratio = (retail_buy_raw / safe_volume).clip(-1, 1).fillna(0)
+    foreign_ownership_pct = (foreign_own_raw / 100).clip(0, 1).fillna(0)
+    print(f"   수급 지표 4개 로드 완료")
+else:
+    foreign_net_ratio = close * 0.0
+    inst_net_ratio = close * 0.0
+    retail_net_ratio = close * 0.0
+    foreign_ownership_pct = close * 0.0
+
 print(f"✅ {len(close.columns)}개 종목, {len(close)}일 데이터")
 print(f"   최신 날짜: {close.index[-1]}")
 print(f"   재무 추세: {list(trend_vars.keys())}")
 
-# ── v3 가격 알파 ──
-v3_alpha = ops.normed_rank(
-    ops.cwise_mul(
-        ops.cwise_mul(
-            ops.ts_delta_ratio(close, 25),
-            ops.div(ops.ts_median(volume, 10), ops.ts_std(volume, 15))
-        ),
-        ops.ts_maxmin_scale(close, 28)
+# ── Multi-Alpha Ensemble (best_alphas.json에서 로드) ──
+alphas_path = project_root / 'best_alphas.json'
+if alphas_path.exists():
+    with open(alphas_path) as f:
+        alpha_configs = _json.load(f)
+
+    print(f"\n🧬 Multi-Alpha Ensemble: {len(alpha_configs)}개 알파 로드")
+    alpha_values_list = []
+    alpha_weights = []
+    alpha_infos = []
+    for i, cfg in enumerate(alpha_configs, 1):
+        expr = cfg['expression']
+        ic = cfg['mean_test_ic']
+        try:
+            val = eval(expr)
+            if isinstance(val, pd.DataFrame):
+                # IC가 양수인 알파만 포함 (음수 IC = 역효과)
+                weight = max(ic, 0.001)
+                alpha_values_list.append(val)
+                alpha_weights.append(weight)
+                alpha_infos.append(cfg)
+                print(f"   #{i} IC={ic:.4f} IR={cfg['mean_test_ir']:.2f} [{cfg['factors']}] ✅")
+            else:
+                print(f"   #{i} 비정상 출력 (DataFrame이 아님) ⚠️")
+        except Exception as e:
+            print(f"   #{i} 계산 실패: {e} ⚠️")
+
+    if alpha_values_list:
+        # IC-weighted average → normed_rank
+        total_w = sum(alpha_weights)
+        tech_alpha = sum(v * (w / total_w) for v, w in zip(alpha_values_list, alpha_weights))
+        tech_alpha = ops.normed_rank(tech_alpha)
+        n_alphas = len(alpha_values_list)
+        print(f"   → {n_alphas}개 알파 IC-weighted 앙상블 완료 (총 가중치: {total_w:.4f})")
+    else:
+        print("   ⚠️ 유효한 알파 없음 → 단일 폴백 알파 사용")
+        tech_alpha = ops.normed_rank(
+            ops.add(
+                ops.div(ops.ts_decayed_linear(foreign_ownership_pct, 8), ops.ts_mean(vol_ratio, 57)),
+                ops.zscore_scale(ops.div(amihud, ops.ts_mean(close, 110)))
+            )
+        )
+        n_alphas = 1
+else:
+    print("\n⚠️ best_alphas.json 없음 → 단일 v10 알파 사용")
+    tech_alpha = ops.normed_rank(
+        ops.add(
+            ops.div(ops.ts_decayed_linear(foreign_ownership_pct, 8), ops.ts_mean(vol_ratio, 57)),
+            ops.zscore_scale(ops.div(amihud, ops.ts_mean(close, 110)))
+        )
     )
-)
+    n_alphas = 1
 
 # ── v6 재무 추세 알파 ──
 v6_alpha = ops.normed_rank(
@@ -220,11 +329,11 @@ v6_alpha = ops.normed_rank(
     )
 )
 
-# ── 앙상블 (50% 가격 + 50% 재무추세) ──
-W_PRICE = 0.50
-W_FUND = 0.50
+# ── 앙상블 (60% multi-alpha tech + 40% 재무추세) ──
+W_TECH = 0.60
+W_FUND = 0.40
 v6_filled = v6_alpha.fillna(0.5)
-ensemble = ops.normed_rank(v3_alpha * W_PRICE + v6_filled * W_FUND)
+ensemble = ops.normed_rank(tech_alpha * W_TECH + v6_filled * W_FUND)
 
 # 최신 날짜 기준
 latest_date = ensemble.index[-1]
@@ -234,19 +343,18 @@ all_scores = ensemble.loc[latest_date].dropna().sort_values(ascending=False)
 exclude_tickers = filtered_out | no_data_tickers
 filtered_scores = all_scores[~all_scores.index.isin(exclude_tickers)]
 
-print(f"\n{'='*90}")
+print(f"\n{'='*100}")
 print(f"🏆 앙상블 상위 종목 (기준일: {latest_date})")
-print(f"   v3 가격 ({W_PRICE:.0%}) + v6 재무추세 ({W_FUND:.0%})")
-print(f"   Train IC: 0.0484 / Test IC: 0.0461 (15-day forward)")
+print(f"   Multi-Alpha Tech ({W_TECH:.0%}, {n_alphas}개 IC-weighted) + v6 재무추세 ({W_FUND:.0%})")
 print(f"   필터: PER ≤ {FILTER_PER_MAX}x, 영업흑자, 순이익흑자")
 print(f"   유니버스: {len(all_scores)}종목 → 필터 통과 {len(filtered_scores)}종목")
-print(f"{'='*90}")
-print(f"{'순위':>4} {'종목코드':<10} {'종목명':<16} {'앙상블':>8} {'v3':>6} {'v6':>6} {'현재가':>12} {'PER':>6} {'NI(억)':>8}")
-print(f"{'-'*90}")
+print(f"{'='*100}")
+print(f"{'순위':>4} {'종목코드':<10} {'종목명':<16} {'앙상블':>8} {'Tech':>6} {'v6':>6} {'현재가':>12} {'PER':>6} {'NI(억)':>8}")
+print(f"{'-'*100}")
 
 for i, (ticker, score) in enumerate(filtered_scores.head(10).items(), 1):
     name = ticker_name.get(ticker, '?')
-    v3_s = v3_alpha.loc[latest_date, ticker] if ticker in v3_alpha.columns else np.nan
+    v10_s = tech_alpha.loc[latest_date, ticker] if ticker in tech_alpha.columns else np.nan
     v6_s = v6_alpha.loc[latest_date, ticker] if ticker in v6_alpha.columns else np.nan
     price = close.loc[latest_date, ticker]
     v = valuation.get(ticker, {})
@@ -254,7 +362,7 @@ for i, (ticker, score) in enumerate(filtered_scores.head(10).items(), 1):
     ni = v.get('trailing_ni', 0)
     ni_억 = ni / 1e8 if ni else 0
     per_s = f"{per:.1f}x" if per and not np.isnan(per) else "  -"
-    print(f"  {i:>2}. {ticker:<10} {name:<16} {score:.4f} {v3_s:.3f}  {v6_s:.3f} {price:>12,.0f}원 {per_s:>6} {ni_억:>7,.0f}억")
+    print(f"  {i:>2}. {ticker:<10} {name:<16} {score:.4f} {v10_s:.3f}  {v6_s:.3f} {price:>12,.0f}원 {per_s:>6} {ni_억:>7,.0f}억")
 
 # 필터로 제외된 상위 종목 (참고용)
 excluded_top = all_scores[all_scores.index.isin(filtered_out)].head(5)
@@ -273,15 +381,15 @@ if not excluded_top.empty:
         print(f"     {ticker:<10} {name:<16} 점수 {score:.4f}  {per_s}  {ni_s}{oi_s}")
 
 # 하위 5종목
-print(f"\n{'='*90}")
+print(f"\n{'='*100}")
 print(f"📉 하위 5종목 (숏 후보, 필터 통과)")
-print(f"{'='*90}")
-print(f"{'순위':>4} {'종목코드':<10} {'종목명':<16} {'앙상블':>8} {'v3':>6} {'v6':>6} {'현재가':>12} {'PER':>6} {'NI(억)':>8}")
-print(f"{'-'*90}")
+print(f"{'='*100}")
+print(f"{'순위':>4} {'종목코드':<10} {'종목명':<16} {'앙상블':>8} {'v10':>6} {'v6':>6} {'현재가':>12} {'PER':>6} {'NI(억)':>8}")
+print(f"{'-'*100}")
 
 for i, (ticker, score) in enumerate(filtered_scores.tail(5).items(), 1):
     name = ticker_name.get(ticker, '?')
-    v3_s = v3_alpha.loc[latest_date, ticker] if ticker in v3_alpha.columns else np.nan
+    v10_s = tech_alpha.loc[latest_date, ticker] if ticker in tech_alpha.columns else np.nan
     v6_s = v6_alpha.loc[latest_date, ticker] if ticker in v6_alpha.columns else np.nan
     price = close.loc[latest_date, ticker]
     v = valuation.get(ticker, {})
@@ -289,11 +397,11 @@ for i, (ticker, score) in enumerate(filtered_scores.tail(5).items(), 1):
     ni = v.get('trailing_ni', 0)
     ni_억 = ni / 1e8 if ni else 0
     per_s = f"{per:.1f}x" if per and not np.isnan(per) else "  -"
-    print(f"  {i:>2}. {ticker:<10} {name:<16} {score:.4f} {v3_s:.3f}  {v6_s:.3f} {price:>12,.0f}원 {per_s:>6} {ni_억:>7,.0f}억")
+    print(f"  {i:>2}. {ticker:<10} {name:<16} {score:.4f} {v10_s:.3f}  {v6_s:.3f} {price:>12,.0f}원 {per_s:>6} {ni_억:>7,.0f}억")
 
 print(f"\n💡 해석:")
-print(f"   v3 가격: 25일 모멘텀 × 거래량 안정성 × 28일 레인지 위치")
+print(f"   Tech: {n_alphas}개 CV-검증 알파 IC-weighted 앙상블 (단일 알파 대비 분산↓ 안정성↑)")
 print(f"   v6 재무: 영업이익 3Q 추세 + YoY + QoQ 개선도 랭킹")
-print(f"   앙상블: 가격 모멘텀 + 실적 개선 동시 확인 → 안정적 매수 신호")
+print(f"   앙상블: Multi-Alpha Tech ({W_TECH:.0%}) + 재무추세 ({W_FUND:.0%})")
 print(f"   필터: PER ≤ {FILTER_PER_MAX}x + 흑자 → 고밸류 모멘텀 함정 제거")
-print(f"   → 15영업일(약 3주) 보유 전략에 최적화")
+print(f"   → 20영업일(약 1달) 보유 전략에 최적화")

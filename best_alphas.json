@@ -1,0 +1,42 @@
+[
+  {
+    "expression": "ops.normed_rank(ops.add(ops.normed_rank(ops.ts_delta_ratio(ops.ts_mean(vwap, 120), 10)), ops.normed_rank(ops.div(amihud, ops.ts_median(close, 20)))))",
+    "mean_test_ic": 0.0598,
+    "mean_test_ir": 0.67,
+    "n_positive_folds": 3,
+    "factors": "price+micro",
+    "source": "v10-gp-run1"
+  },
+  {
+    "expression": "ops.zscore_scale(ops.add(ops.div(ops.ts_decayed_linear(foreign_net_ratio, 25), ops.ts_decayed_linear(vol_ratio, 55)), ops.zscore_scale(ops.div(amihud, ops.ts_mean(close, 32)))))",
+    "mean_test_ic": 0.0523,
+    "mean_test_ir": 0.81,
+    "n_positive_folds": 3,
+    "factors": "price+volume+micro+flow",
+    "source": "v10-gp-run1"
+  },
+  {
+    "expression": "ops.zscore_scale(ops.add(ops.div(ops.ts_mean(foreign_ownership_pct, 8), ops.ts_decayed_linear(vol_ratio, 32)), ops.zscore_scale(ops.div(amihud, ops.ts_mean(close, 20)))))",
+    "mean_test_ic": 0.0493,
+    "mean_test_ir": 0.75,
+    "n_positive_folds": 4,
+    "factors": "price+volume+micro+flow",
+    "source": "v10-gp-run2"
+  },
+  {
+    "expression": "ops.normed_rank(ops.add(ops.ts_corr(foreign_net_ratio, amount, 30), ops.add(ops.normed_rank(ops.div(ops.add(low, vol_ratio), ops.ts_std(close, 60))), ops.ts_corr(amihud, intraday_ret, 60))))",
+    "mean_test_ic": 0.0461,
+    "mean_test_ir": 0.34,
+    "n_positive_folds": 3,
+    "factors": "price+volume+micro+flow",
+    "source": "v11-gp-run3"
+  },
+  {
+    "expression": "ops.normed_rank(ops.neg(ops.ts_corr(returns, vol_ratio, 20)))",
+    "mean_test_ic": 0.0347,
+    "mean_test_ir": 0.40,
+    "n_positive_folds": 4,
+    "factors": "volume+returns",
+    "source": "v11-gp-run3"
+  }
+]
