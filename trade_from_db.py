@@ -16,7 +16,7 @@ from psycopg2.extras import execute_values
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from alpha_gpt_kr.trading.kis_api import KISAPI
+from alpha_gpt_kr.trading.kis_api import KISApi
 from alpha_gpt_kr.trading.trader import AlphaTrader
 
 # 환경 변수 로드
@@ -160,7 +160,7 @@ def execute_trades(df_scores, dry_run=False, target_amount=5000000):
         target_amount: 총 투자 금액
     """
     # KIS API 초기화
-    api = KISAPI(
+    api = KISApi(
         app_key=os.getenv('KIS_APP_KEY'),
         app_secret=os.getenv('KIS_APP_SECRET'),
         account_no=os.getenv('KIS_ACCOUNT_NO'),

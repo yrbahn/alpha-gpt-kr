@@ -1,0 +1,2 @@
+IC: 0.0236
+Alpha: (AlphaOperators.ts_delta(macd, 24) > AlphaOperators.ts_delta(macd_signal, 5)) & (volume > AlphaOperators.ts_mean(volume, 26))

@@ -1,0 +1,7 @@
+[
+  "AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 15), 10)",
+  "AlphaOperators.ts_rank(AlphaOperators.ts_mean(returns, 15), 10)",
+  "AlphaOperators.ts_rank(close / AlphaOperators.ts_mean(close, 20), 15)",
+  "AlphaOperators.ts_rank(volume / AlphaOperators.ts_mean(volume, 15), 10)",
+  "AlphaOperators.ts_rank(AlphaOperators.ts_delta(close, 15) / AlphaOperators.ts_std(close, 20), 10)"
+]

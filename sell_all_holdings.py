@@ -102,7 +102,7 @@ def main():
         print(f"\n📉 Selling {ticker} ({name}): {qty}주")
         
         try:
-            sell_order = api.sell_market(ticker, qty)
+            sell_order = api.sell_stock(ticker, qty, order_type="01")
             results.append({
                 'ticker': ticker,
                 'name': name,

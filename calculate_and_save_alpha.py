@@ -18,14 +18,14 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from alpha_gpt_kr.data.postgres_loader import PostgresDataLoader
-from alpha_gpt_kr.mining import operators as ops
+from alpha_gpt_kr.mining.operators import AlphaOperators
 
 # 환경 변수 로드
 load_dotenv()
 
-# 현재 최적 알파 (GP 진화 결과)
-CURRENT_ALPHA = "ops.ts_delta(close, 26)"
-ALPHA_DESCRIPTION = "26-day momentum (GP evolved, IC: 0.0045, Sharpe: 0.57)"
+# 현재 최적 알파 (재무 알파 - 500종목 검증 완료, IC 0.0751)
+CURRENT_ALPHA = "AlphaOperators.normed_rank((net_income / total_assets) + (operating_income / total_assets))"
+ALPHA_DESCRIPTION = "Fundamental Alpha: ROA + Operating ROA (IC: 0.0751, IR: 0.92, 500-stock verified)"
 
 def get_db_connection():
     """PostgreSQL 연결"""
@@ -90,37 +90,45 @@ def calculate_alpha_scores(top_n=500):
     
     print(f"📈 Calculating alpha: {CURRENT_ALPHA}")
     
-    # 종목별 알파 계산
-    results = []
-    for ticker in top_tickers:
-        try:
-            # 해당 종목의 close 데이터
-            close_series = close_df[ticker].dropna()
-            
-            if len(close_series) < 30:  # 최소 30일 필요
+    # returns 계산 (전체 DataFrame에서)
+    returns = close_df.pct_change()
+    
+    # Cross-sectional 알파 계산 (최신 날짜 기준)
+    try:
+        # 알파 계산: AlphaOperators.ts_rank(AlphaOperators.ts_mean(returns, 1), 26)
+        close = close_df[top_tickers]
+        volume = volume_df[top_tickers] if volume_df is not None else None
+        returns = close.pct_change()
+        
+        # 알파 계산
+        alpha_values = eval(CURRENT_ALPHA)
+        
+        # 최신 날짜의 알파값
+        latest_alpha = alpha_values.iloc[-1]
+        
+        # 종목별 결과 생성
+        results = []
+        for ticker in top_tickers:
+            if ticker not in latest_alpha.index or pd.isna(latest_alpha[ticker]):
                 continue
             
-            close_values = close_series.values
+            latest_close_price = close[ticker].iloc[-1]
+            latest_volume = volume[ticker].iloc[-1] if volume is not None else 0
             
-            # 알파 계산: ops.ts_delta(close, 26)
-            alpha = ops.ts_delta(close_values, 26)
+            results.append({
+                'stock_code': ticker,
+                'stock_name': ticker,
+                'alpha_score': float(latest_alpha[ticker]),
+                'market_cap': int(latest_close_price * latest_volume) if volume is not None else 0,
+                'close_price': float(latest_close_price),
+                'volume': int(latest_volume) if volume is not None else 0
+            })
             
-            if len(alpha) > 0 and not np.isnan(alpha[-1]):
-                # 최신 데이터
-                latest_close_price = close_series.iloc[-1]
-                latest_volume = volume_df[ticker].iloc[-1] if volume_df is not None else 0
-                
-                results.append({
-                    'stock_code': ticker,
-                    'stock_name': ticker,  # 나중에 stocks 테이블에서 이름 가져오기
-                    'alpha_score': float(alpha[-1]),
-                    'market_cap': int(latest_close_price * latest_volume) if volume_df is not None else 0,
-                    'close_price': float(latest_close_price),
-                    'volume': int(latest_volume) if volume_df is not None else 0
-                })
-        except Exception as e:
-            print(f"⚠️  Error calculating alpha for {ticker}: {e}")
-            continue
+    except Exception as e:
+        print(f"❌ Error calculating alpha: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     
     # DataFrame 생성 및 정렬
     result_df = pd.DataFrame(results)

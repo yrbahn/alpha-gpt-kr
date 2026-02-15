@@ -72,7 +72,8 @@ class PostgresDataLoader:
                   start_date: str = None,
                   end_date: str = None,
                   universe: Optional[List[str]] = None,
-                  include_technical: bool = False) -> Dict[str, pd.DataFrame]:
+                  include_technical: bool = False,
+                  include_supply_demand: bool = False) -> Dict[str, pd.DataFrame]:
         """
         가격 데이터 로드
         
@@ -81,9 +82,11 @@ class PostgresDataLoader:
             end_date: 종료일 (YYYY-MM-DD)
             universe: 종목 코드 리스트 (None이면 전체)
             include_technical: 기술적 지표 포함 여부
+            include_supply_demand: 수급 데이터 포함 여부 (외국인/기관/개인 순매수)
             
         Returns:
             Dict with keys: 'close', 'open', 'high', 'low', 'volume', 'vwap'
+            수급 데이터 포함 시: 'foreign_net', 'inst_net', 'indiv_net', 'foreign_ownership'
             각 value는 DataFrame (index=date, columns=ticker)
         """
         logger.info(f"데이터 로드 시작: {start_date} ~ {end_date}")
@@ -113,6 +116,13 @@ class PostgresDataLoader:
                 tech_df = self._load_technical_indicators(conn, stocks_df, start_date, end_date)
                 tech_panel = self._convert_technical_to_panel(tech_df, stocks_df)
                 panel_data.update(tech_panel)
+            
+            # 5. 수급 데이터 추가 (옵션)
+            if include_supply_demand:
+                sd_df = self._load_supply_demand_data(conn, stocks_df, start_date, end_date)
+                sd_panel = self._convert_supply_demand_to_panel(sd_df, stocks_df)
+                panel_data.update(sd_panel)
+                logger.info(f"수급 데이터 추가: {list(sd_panel.keys())}")
             
             logger.info(f"✅ 데이터 로드 완료: {list(panel_data.keys())}")
             return panel_data
@@ -257,6 +267,77 @@ class PostgresDataLoader:
                 pivot = tech_df.pivot(index='date', columns='ticker', values=field)
                 pivot.index = pd.to_datetime(pivot.index)
                 panel_data[field] = pivot
+        
+        return panel_data
+    
+    def _load_supply_demand_data(self, conn, stocks_df: pd.DataFrame,
+                                  start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        수급 데이터 로드 (외국인/기관/개인 순매수, 외국인 보유비율)
+        
+        Args:
+            conn: DB 연결
+            stocks_df: 종목 정보 DataFrame
+            start_date: 시작일
+            end_date: 종료일
+            
+        Returns:
+            수급 데이터 DataFrame
+        """
+        stock_ids = stocks_df['id'].tolist()
+        stock_id_list = ', '.join(map(str, stock_ids))
+        
+        query = f"""
+            SELECT 
+                sd.stock_id,
+                sd.date,
+                sd.foreign_net_buy,
+                sd.institution_net_buy,
+                sd.individual_net_buy,
+                sd.foreign_ownership
+            FROM supply_demand_data sd
+            WHERE sd.stock_id IN ({stock_id_list})
+                AND sd.date >= '{start_date}'
+                AND sd.date <= '{end_date}'
+            ORDER BY sd.date, sd.stock_id;
+        """
+        
+        df = pd.read_sql(query, conn)
+        
+        # stock_id를 ticker로 매핑
+        id_to_ticker = dict(zip(stocks_df['id'], stocks_df['ticker']))
+        df['ticker'] = df['stock_id'].map(id_to_ticker)
+        
+        logger.info(f"수급 데이터: {len(df)} 행, {df['date'].nunique()} 일")
+        return df
+    
+    def _convert_supply_demand_to_panel(self, sd_df: pd.DataFrame,
+                                         stocks_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """
+        수급 데이터를 Panel 형태로 변환
+        
+        Returns:
+            Dict with keys:
+            - 'foreign_net': 외국인 순매수
+            - 'inst_net': 기관 순매수
+            - 'indiv_net': 개인 순매수
+            - 'foreign_ownership': 외국인 보유비율
+        """
+        panel_data = {}
+        
+        # 컬럼 매핑 (DB 컬럼명 -> 짧은 이름)
+        field_mapping = {
+            'foreign_net_buy': 'foreign_net',
+            'institution_net_buy': 'inst_net',
+            'individual_net_buy': 'indiv_net',
+            'foreign_ownership': 'foreign_ownership'
+        }
+        
+        for db_field, panel_field in field_mapping.items():
+            if db_field in sd_df.columns:
+                pivot = sd_df.pivot(index='date', columns='ticker', values=db_field)
+                pivot.index = pd.to_datetime(pivot.index)
+                panel_data[panel_field] = pivot
         
         return panel_data
     
