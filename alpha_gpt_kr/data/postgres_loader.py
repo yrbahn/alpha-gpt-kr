@@ -273,7 +273,7 @@ class PostgresDataLoader:
     def _load_supply_demand_data(self, conn, stocks_df: pd.DataFrame,
                                   start_date: str, end_date: str) -> pd.DataFrame:
         """
-        수급 데이터 로드 (외국인/기관/개인 순매수, 외국인 보유비율)
+        수급 데이터 로드 (외국인/기관/개인 순매수, 외국인 보유비율, 공매도)
         
         Args:
             conn: DB 연결
@@ -294,7 +294,8 @@ class PostgresDataLoader:
                 sd.foreign_net_buy,
                 sd.institution_net_buy,
                 sd.individual_net_buy,
-                sd.foreign_ownership
+                sd.foreign_ownership,
+                sd.short_volume
             FROM supply_demand_data sd
             WHERE sd.stock_id IN ({stock_id_list})
                 AND sd.date >= '{start_date}'
@@ -322,6 +323,7 @@ class PostgresDataLoader:
             - 'inst_net': 기관 순매수
             - 'indiv_net': 개인 순매수
             - 'foreign_ownership': 외국인 보유비율
+            - 'short_volume': 공매도 거래량
         """
         panel_data = {}
         
@@ -330,7 +332,8 @@ class PostgresDataLoader:
             'foreign_net_buy': 'foreign_net',
             'institution_net_buy': 'inst_net',
             'individual_net_buy': 'indiv_net',
-            'foreign_ownership': 'foreign_ownership'
+            'foreign_ownership': 'foreign_ownership',
+            'short_volume': 'short_volume'
         }
         
         for db_field, panel_field in field_mapping.items():
