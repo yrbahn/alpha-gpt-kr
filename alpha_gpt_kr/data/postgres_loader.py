@@ -120,9 +120,7 @@ class PostgresDataLoader:
             # 5. 수급 데이터 추가 (옵션)
             if include_supply_demand:
                 sd_df = self._load_supply_demand_data(conn, stocks_df, start_date, end_date)
-                # volume 데이터를 전달하여 short_ratio 계산
-                price_volume = panel_data.get('volume', None)
-                sd_panel = self._convert_supply_demand_to_panel(sd_df, stocks_df, price_volume)
+                sd_panel = self._convert_supply_demand_to_panel(sd_df, stocks_df)
                 panel_data.update(sd_panel)
                 logger.info(f"수급 데이터 추가: {list(sd_panel.keys())}")
             
@@ -315,15 +313,9 @@ class PostgresDataLoader:
         return df
     
     def _convert_supply_demand_to_panel(self, sd_df: pd.DataFrame,
-                                         stocks_df: pd.DataFrame,
-                                         price_volume: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
+                                         stocks_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         """
         수급 데이터를 Panel 형태로 변환
-        
-        Args:
-            sd_df: 수급 데이터 DataFrame
-            stocks_df: 종목 정보
-            price_volume: 가격 데이터의 거래량 (short_ratio 계산용)
         
         Returns:
             Dict with keys:
@@ -332,7 +324,6 @@ class PostgresDataLoader:
             - 'indiv_net': 개인 순매수
             - 'foreign_ownership': 외국인 보유비율
             - 'short_volume': 공매도 거래량
-            - 'short_ratio': 공매도 비율 (short_volume / volume)
         """
         panel_data = {}
         
@@ -350,21 +341,6 @@ class PostgresDataLoader:
                 pivot = sd_df.pivot(index='date', columns='ticker', values=db_field)
                 pivot.index = pd.to_datetime(pivot.index)
                 panel_data[panel_field] = pivot
-        
-        # short_ratio 계산: short_volume / volume
-        if 'short_volume' in panel_data and price_volume is not None:
-            short_vol = panel_data['short_volume']
-            # 공통 인덱스와 컬럼으로 정렬
-            common_idx = short_vol.index.intersection(price_volume.index)
-            common_cols = short_vol.columns.intersection(price_volume.columns)
-            
-            if len(common_idx) > 0 and len(common_cols) > 0:
-                sv = short_vol.loc[common_idx, common_cols]
-                vol = price_volume.loc[common_idx, common_cols]
-                # 0으로 나누기 방지
-                short_ratio = sv / vol.replace(0, np.nan)
-                panel_data['short_ratio'] = short_ratio
-                logger.info(f"공매도 비율 계산: {short_ratio.shape}")
         
         return panel_data
     
