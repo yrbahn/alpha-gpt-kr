@@ -1,0 +1,7 @@
+# Low Volatility Alpha for KOSDAQ 200
+# Hypothesis: Low long-term volatility -> 1 month outperformance
+# Test IC: 0.1261
+# Train IC: 0.2024
+# IR: 1.41
+
+ops.neg(ops.ts_mean(ops.ts_std(atr_ratio, 60), 15))

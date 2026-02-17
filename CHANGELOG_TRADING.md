@@ -92,3 +92,22 @@ trader.rebalance_portfolio(force=True)
 - [ ] 포트폴리오 성과 리포트
 - [ ] 텔레그램 알림
 - [ ] 웹 대시보드
+
+## 2026-02-17: v4 Combined Alpha (IC 0.1376)
+
+### 변경사항
+- `trade_kosdaq200_alpha.py` v3 → v4 업데이트
+- 알파 공식: 저변동성 3종 결합
+  - `neg(ts_mean(ts_std(atr_ratio, 60), 15))`
+  - `neg(ts_std(volume, 75))`
+  - `neg(ts_mean(high_low_range, 120))`
+- Test IC: 0.1376 (최고 성능)
+
+### 핵심 인사이트
+- KOSDAQ은 저변동성 선호 (coiled spring 효과)
+- 수급 데이터 불필요 (저변동성만으로 충분)
+
+### Top 3 종목 (2/13 기준)
+1. 안랩 (053800)
+2. 메디톡스 (086900)
+3. 씨젠 (096530)

@@ -1,37 +1,37 @@
 [
   {
     "expression": "ops.normed_rank(ops.neg(ops.ts_corr(returns, vol_ratio, 20)))",
-    "mean_test_ic": 0.03465264141404458,
-    "mean_test_ir": 0.399337217792459,
+    "mean_test_ic": 0.06334331692817871,
+    "mean_test_ir": 0.7127972933950053,
     "n_positive_folds": 4,
     "factors": "volume+returns"
   },
   {
-    "expression": "ops.normed_rank(ops.div(amihud, ops.ts_median(close, 20)))",
-    "mean_test_ic": 0.02618088637253897,
-    "mean_test_ir": 0.46892355138218994,
-    "n_positive_folds": 3,
-    "factors": "price+micro"
-  },
-  {
-    "expression": "ops.normed_rank(ops.add(ops.ts_mean(lower_shadow, 15), ops.div(close, ops.ts_mean(close, 120))))",
-    "mean_test_ic": 0.0128146622509696,
-    "mean_test_ir": 0.15509113112978193,
-    "n_positive_folds": 3,
-    "factors": "price+volatility"
-  },
-  {
     "expression": "ops.normed_rank(ops.div(close, ops.ts_mean(close, 120)))",
-    "mean_test_ic": 0.012641344395038893,
-    "mean_test_ir": 0.1538073752853765,
+    "mean_test_ic": 0.020615469769991356,
+    "mean_test_ir": 0.2010131251329372,
     "n_positive_folds": 3,
     "factors": "price"
   },
   {
-    "expression": "ops.normed_rank(ops.add(ops.normed_rank(ops.ts_delta_ratio(ops.ts_mean(vwap, 120), 10)), ops.normed_rank(ops.div(amihud, ops.ts_median(close, 20)))))",
-    "mean_test_ic": 0.04323112729152242,
-    "mean_test_ir": 0.49053714316684754,
+    "expression": "ops.normed_rank(ops.add(ops.ts_mean(lower_shadow, 15), ops.div(close, ops.ts_mean(close, 120))))",
+    "mean_test_ic": 0.019920195182090112,
+    "mean_test_ir": 0.19722362857313128,
+    "n_positive_folds": 3,
+    "factors": "price+volatility"
+  },
+  {
+    "expression": "ops.normed_rank(ops.cwise_mul(ops.ts_regression_residual(returns, vol_ratio, 20), ops.neg(ops.ts_mean(gap, 10))))",
+    "mean_test_ic": -0.002250332811322495,
+    "mean_test_ir": -0.02034906107393487,
     "n_positive_folds": 2,
-    "factors": "price+micro"
+    "factors": "volume+returns+micro"
+  },
+  {
+    "expression": "ops.normed_rank(ops.minus(ops.ts_rank(close, 20), ops.ts_rank(volume, 20)))",
+    "mean_test_ic": -0.005302949660189632,
+    "mean_test_ir": -0.05588975180891867,
+    "n_positive_folds": 2,
+    "factors": "price+volume"
   }
 ]
