@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-KOSDAQ 200 알파 트레이딩 (v4 - Combined Alpha)
-- 알파: 저변동성 3종 결합 (ATR + Volume + HL Range)
-- Test IC: 0.1376 (최고 성능)
+KOSDAQ 200 알파 트레이딩 (v5 - LV3 + 볼린저)
+- 알파: 저변동성 3종 + 볼린저 수축
+- Test IC: 0.0952 (+4% vs v4)
 - 리밸런싱: 월간 (20영업일)
 - 종목수: 3개
 """
@@ -59,14 +59,15 @@ def get_kosdaq_200():
 
 def compute_alpha(data):
     """
-    Combined Alpha (v4): 저변동성 3종 결합
-    - Test IC: 0.1376 (최고 성능)
-    - 핵심 인사이트: KOSDAQ은 저변동성 선호 (coiled spring)
+    Combined Alpha (v5): 저변동성 3종 + 볼린저 수축
+    - Test IC: 0.0952 (+4% vs v4)
+    - 핵심 인사이트: KOSDAQ은 저변동성 + 변동성 압축 선호
     
     구성:
     1. ATR 변동성 (60일 std → 15일 평균): 낮을수록 좋음
     2. 거래량 변동성 (75일 std): 낮을수록 좋음  
     3. 고저 범위 (120일 평균): 낮을수록 좋음
+    4. 볼린저 수축 (20일 std / 20일 mean): 낮을수록 좋음 (NEW)
     """
     close = data['close']
     high = data['high']
@@ -87,10 +88,17 @@ def compute_alpha(data):
     # 3. 고저 범위: neg(ts_mean(high_low_range, 120))
     lv3 = ops.neg(ops.ts_mean(high_low_range, 120))
     
-    # ── Combined Alpha (z-score 정규화 후 합산) ──
+    # ── 신규: 볼린저 수축 ──
+    # 4. 볼린저 수축: neg(ts_std(close, 20) / ts_mean(close, 20))
+    bollinger_squeeze = ops.neg(ops.div(ops.ts_std(close, 20), ops.ts_mean(close, 20)))
+    
+    # ── Combined Alpha v5 (z-score 정규화 후 합산) ──
     alpha = ops.add(
-        ops.add(ops.zscore_scale(lv1), ops.zscore_scale(lv2)),
-        ops.zscore_scale(lv3)
+        ops.add(
+            ops.add(ops.zscore_scale(lv1), ops.zscore_scale(lv2)),
+            ops.zscore_scale(lv3)
+        ),
+        ops.zscore_scale(bollinger_squeeze)
     )
     
     return alpha
@@ -105,7 +113,7 @@ def get_top_stocks(alpha, top_n=10):
 
 def main():
     print("=" * 70)
-    print(f"🚀 KOSDAQ 200 알파 트레이딩 (v4 Combined) - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"🚀 KOSDAQ 200 알파 트레이딩 (v5 LV3+볼린저) - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 70)
     
     # 1. KOSDAQ 200 종목 로드
@@ -126,7 +134,7 @@ def main():
     print(f"  ✅ {len(data['close'])}일 데이터")
     
     # 3. 알파 계산
-    print("\n📊 3. Combined Alpha 계산 (저변동성 3종)...")
+    print("\n📊 3. Combined Alpha v5 계산 (저변동성 3종 + 볼린저)...")
     alpha = compute_alpha(data)
     
     # 4. 상위 종목 선택
@@ -134,7 +142,7 @@ def main():
     top_stocks = get_top_stocks(alpha, TOP_N)
     
     print("\n" + "=" * 70)
-    print("🏆 추천 종목 (알파 순위) - IC 0.1376")
+    print("🏆 추천 종목 (알파 순위) - v5 IC 0.0952")
     print("=" * 70)
     
     for i, (ticker, score) in enumerate(top_stocks.items(), 1):
